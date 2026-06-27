@@ -109,6 +109,10 @@ def migrate_db():
                 _exec(conn, "UPDATE payments SET status = COALESCE(status, 'unpaid')")
         _add_col(conn, "expenses", "created_at", ts)
         _add_col(conn, "expenses", "note", "TEXT")
+        _add_col(conn, "expenses", "category", "VARCHAR(120)")
+        _add_col(conn, "expenses", "expense_date", ts)
+        _add_col(conn, "expenses", "receipt_path", "TEXT")
+        _add_col(conn, "expenses", "created_by", "VARCHAR(120)")
         # Bot state stores the latest LINE group/room/user target so the app can push an updated card after payment.
         _add_col(conn, "bot_state", "value", "TEXT")
         _add_col(conn, "bot_state", "updated_at", ts)

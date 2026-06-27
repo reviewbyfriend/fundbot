@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 import secrets
+import html
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -22,18 +23,21 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .database import SessionLocal, get_db, init_db
 from . import services
-from .line_client import flex, reply, push, text
+from .line_client import flex, reply, push, text, download_message_content
 from .promptpay import qr_png_base64
 from .report import make_excel, make_word, make_pdf
 from PIL import Image, ImageOps
 from .models import Expense, Payment, BotState, AdminUser, AdminAuditLog
+from .timezone import now_bangkok, format_th
 
 app = FastAPI(title="FundBot v2 Stable")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 Path(settings.SLIP_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
 Path(settings.SIGNATURE_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.EXPENSE_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
 app.mount("/slips", StaticFiles(directory=settings.SLIP_STORAGE_DIR), name="slips")
 app.mount("/signatures", StaticFiles(directory=settings.SIGNATURE_STORAGE_DIR), name="signatures")
+app.mount("/expenses", StaticFiles(directory=settings.EXPENSE_STORAGE_DIR), name="expenses")
 
 @app.on_event("startup")
 def startup():
@@ -43,7 +47,7 @@ def startup():
         if db.query(services.Member).count() == 0:
             services.seed_members(db)
         if not services.active_round(db):
-            now = datetime.now()
+            now = now_bangkok()
             services.open_round(db, f"{now.strftime('%Y-%m')}")
         ensure_owner_admin(db)
     finally:
@@ -231,7 +235,7 @@ def signature_public_url(receipt_path: str | None) -> str:
         return ""
 
 def current_month_key() -> str:
-    return datetime.now().strftime("%Y-%m")
+    return now_bangkok().strftime("%Y-%m")
 
 def save_upload_image(upload: UploadFile, folder: Path, prefix: str) -> Path:
     content_type = (upload.content_type or "").lower()
@@ -470,7 +474,108 @@ def collection_flex(db: Session):
     return flex("เงินกองสำนักงาน", contents)
 
 def menu_text():
-    return text("FundBot ใช้งานหลัก:\n• ส่งหน้าเก็บเงิน\n• ชำระเงิน\n• สรุป")
+    return text("FundBot ใช้งานหลัก:\n• ส่งหน้าเก็บเงิน\n• ชำระเงิน\n• สรุป\n\nรายจ่าย/รายงานใน LINE:\n• รายจ่าย ค่าอาหาร 250\n• รายจ่าย ค่าถ่ายเอกสาร 120 หมวด เอกสาร\n• ส่งรูปใบเสร็จหลังจากบันทึกรายจ่าย\n• รายงาน / พิมพ์รายงาน")
+
+
+def report_links_text():
+    return text(
+        "📄 ออกรายงานเงินกอง\n"
+        f"Excel: {base_url()}/report.xlsx\n"
+        f"Word: {base_url()}/report.docx\n"
+        f"PDF: {base_url()}/report.pdf\n\n"
+        "ถ้าจะปริ้น แนะนำเปิด Excel/Word แล้วสั่งพิมพ์จากเครื่องค่ะ"
+    )
+
+
+def parse_expense_line(raw: str):
+    # รูปแบบ: รายจ่าย ค่าอาหาร 250 หรือ รายจ่าย ค่าอาหาร 250 หมวด อาหาร
+    body = raw.replace("เพิ่มรายจ่าย", "", 1).replace("รายจ่าย", "", 1).strip()
+    amount = parse_amount(body)
+    if amount is None:
+        return None, None, None, None
+    m = re.search(r"([0-9][0-9,]*(?:\.\d+)?)", body)
+    title = body[:m.start()].strip(" -:：") if m else body
+    tail = body[m.end():].strip() if m else ""
+    category = None
+    cat_match = re.search(r"หมวด\s+(.+)$", tail)
+    if cat_match:
+        category = cat_match.group(1).strip()
+    if not title:
+        title = "รายจ่ายไม่ระบุรายการ"
+    return title, amount, category, tail
+
+
+def expense_receipt_dir():
+    ym = now_bangkok().strftime("%Y-%m")
+    d = Path(settings.EXPENSE_STORAGE_DIR) / ym
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_expense_receipt_bytes(content: bytes) -> str:
+    out = expense_receipt_dir() / f"{uuid.uuid4().hex}.jpg"
+    tmp = out.with_suffix(".tmp")
+    tmp.write_bytes(content)
+    try:
+        img = Image.open(tmp)
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((1600, 1600))
+        img.save(out, "JPEG", quality=82, optimize=True)
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        tmp.rename(out)
+    return str(out)
+
+
+def expense_receipt_exists(e: Expense) -> bool:
+    path = getattr(e, "receipt_path", None)
+    return bool(path and Path(path).exists())
+
+
+def expense_receipt_url(e: Expense, token: str = "") -> str:
+    q = f"?token={token}" if token else ""
+    return f"/admin/expense/receipt/{e.id}{q}"
+
+
+def add_expense(db: Session, title: str, amount: Decimal, category: str | None = None, note: str | None = None, created_by: str | None = None):
+    r = services.active_round(db)
+    if not r:
+        r = services.open_round(db, now_bangkok().strftime("%Y-%m"))
+    e = Expense(
+        round_id=r.id,
+        title=title,
+        amount=amount,
+        category=category,
+        note=note,
+        created_by=created_by,
+        expense_date=now_bangkok().replace(tzinfo=None),
+    )
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    return e
+
+
+def handle_line_image(reply_token: str, message_id: str):
+    db = SessionLocal()
+    try:
+        pending_id = get_state(db, "line_pending_expense_id")
+        if pending_id:
+            e = db.query(Expense).filter(Expense.id == int(pending_id)).first()
+            if e:
+                content = download_message_content(message_id)
+                if not content:
+                    reply(reply_token, [text("รับรูปแล้ว แต่ดาวน์โหลดจาก LINE ไม่สำเร็จ ลองส่งรูปอีกครั้งนะคะ")])
+                    return
+                e.receipt_path = save_expense_receipt_bytes(content)
+                e.note = ((e.note or "") + "\nแนบใบเสร็จจาก LINE").strip()
+                db.commit()
+                set_state(db, "line_pending_expense_id", "")
+                reply(reply_token, [text(f"✅ แนบใบเสร็จแล้ว\n{e.title} {money(e.amount)} บาท\nถ้าจะพิมพ์รายงาน พิมพ์: รายงาน"), report_links_text()])
+                return
+        reply(reply_token, [text("รับรูปแล้วค่ะ ถ้าเป็นใบเสร็จ ให้พิมพ์รายจ่ายก่อน เช่น\nรายจ่าย ค่าอาหาร 250\nแล้วส่งรูปใบเสร็จตามมา")])
+    finally:
+        db.close()
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -492,7 +597,7 @@ async def webhook(req: Request):
         if msg.get("type") == "text":
             handle_text(token, msg.get("text", ""))
         elif msg.get("type") == "image":
-            reply(token, [text(f"รับรูปแล้วค่ะ เพื่อเลือกชื่อให้ถูกต้อง กรุณาอัปโหลดสลิปที่หน้าเว็บ\n{base_url()}/pay")])
+            handle_line_image(token, msg.get("id", ""))
     return {"ok": True}
 
 def handle_text(reply_token: str, raw: str):
@@ -522,6 +627,18 @@ def handle_text(reply_token: str, raw: str):
             return
         if low in ["เมนู", "menu", "help"]:
             reply(reply_token, [menu_text()])
+            return
+        if low.startswith("รายจ่าย") or low.startswith("เพิ่มรายจ่าย"):
+            title, amount, category, note = parse_expense_line(s)
+            if amount is None:
+                reply(reply_token, [text("รูปแบบรายจ่าย:\nรายจ่าย ค่าอาหาร 250\nหรือ รายจ่าย ค่าถ่ายเอกสาร 120 หมวด เอกสาร")])
+                return
+            e = add_expense(db, title, amount, category=category, note="บันทึกจาก LINE", created_by="LINE")
+            set_state(db, "line_pending_expense_id", str(e.id))
+            reply(reply_token, [text(f"✅ บันทึกรายจ่ายแล้ว\n{e.title} {money(e.amount)} บาท\nส่งรูปใบเสร็จต่อจากข้อความนี้ได้เลย ระบบจะแนบเข้าเดือน {services.active_round(db).title}")])
+            return
+        if low in ["รายงาน", "พิมพ์รายงาน", "ออกรายงาน", "report"]:
+            reply(reply_token, [report_links_text()])
             return
         if low in ["ส่งหน้าเก็บเงิน", "เก็บเงิน", "รายการ", "dashboard", "แดชบอร์ด"]:
             reply(reply_token, [collection_flex(db)])
@@ -581,7 +698,7 @@ def api_status(db: Session = Depends(get_db)):
         "round": r.title if r else "-",
         "due": float(t["due"]), "paid": float(t["paid"]), "unpaid": float(t["unpaid"]),
         "paid_count": t["paid_count"], "waiting_count": len([p for p in pays if p.status == "pending"]), "unpaid_count": len([p for p in pays if p.status != "paid" and p.status != "pending"]), "count": t["count"],
-        "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else ""} for p in pays]
+        "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": format_th(p.paid_at, default='')} for p in pays]
     }
 
 @app.websocket("/ws")
@@ -603,7 +720,7 @@ async def websocket_status(ws: WebSocket):
                     "waiting_count": len([p for p in pays if p.status == "pending"]),
                     "unpaid_count": len([p for p in pays if p.status != "paid" and p.status != "pending"]),
                     "count": t["count"],
-                    "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else ""} for p in pays],
+                    "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": format_th(p.paid_at, default='')} for p in pays],
                 })
             finally:
                 db.close()
@@ -879,14 +996,86 @@ def report_docx(db: Session = Depends(get_db)):
     r = services.active_round(db)
     if not r: raise HTTPException(404)
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
-    return Response(make_word(r, payments), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition":"attachment; filename=fundbot_report.docx"})
+    expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date, Expense.id).all()
+    return Response(make_word(r, payments, expenses), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition":"attachment; filename=fundbot_report.docx"})
 
 @app.get("/report.pdf")
 def report_pdf(db: Session = Depends(get_db)):
     r = services.active_round(db)
     if not r: raise HTTPException(404)
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
-    return Response(make_pdf(r, payments), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=fundbot_report.pdf"})
+    expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date, Expense.id).all()
+    return Response(make_pdf(r, payments, expenses), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=fundbot_report.pdf"})
+
+
+@app.get("/admin/expenses", response_class=HTMLResponse)
+def admin_expenses(request: Request, token: str = "", db: Session = Depends(get_db)):
+    admin_ctx = require_admin(request, db, token)
+    r = services.active_round(db)
+    expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date.desc(), Expense.id.desc()).all() if r else []
+    query = f"?token={token}" if token else ""
+    token_hidden = f"<input type='hidden' name='token' value='{html.escape(token)}'>" if token else ""
+    total_exp = sum([Decimal(e.amount or 0) for e in expenses], Decimal("0"))
+    rows = "".join([f"""
+    <div class='member-row'>
+      <div class='avatar'>🧾</div>
+      <b>{html.escape(e.title)}</b>
+      <b style='text-align:right'>{money(e.amount)}</b>
+      <span class='status pill {'paid' if expense_receipt_exists(e) else 'partial'}'>{'มีใบเสร็จ' if expense_receipt_exists(e) else 'ยังไม่มีรูป'}</span>
+    </div>
+    <div class='copybox'>วันที่ {format_th(getattr(e, 'expense_date', None), '%d/%m/%Y', default='-')} · หมวด {html.escape(getattr(e, 'category', '') or '-')} · ผู้บันทึก {html.escape(getattr(e, 'created_by', '') or '-')}
+      {'<br><a class="btn2" target="_blank" href="'+expense_receipt_url(e, token)+'">เปิดใบเสร็จ</a>' if expense_receipt_exists(e) else ''}
+    </div>
+    """ for e in expenses]) or "<p class='muted'>ยังไม่มีรายจ่าย</p>"
+    body = f"""
+    <div class='hero'><div class='title'>🧾 รายจ่ายเงินกอง</div><div class='sub'>กรอกเหมือนลง Excel แต่ทำผ่านเว็บ/LINE ได้ · รอบ {r.title if r else '-'}</div></div>
+    <div class='top-actions'><a class='btn2' href='/admin{query}'>กลับหน้าอนุมัติ</a><a class='btn2' href='/report.xlsx'>ดาวน์โหลด Excel</a><a class='btn2' href='/report.docx'>Word</a></div>
+    <div class='stats'><div class='stat'><b>รวมรายจ่าย</b><div class='num red'>{money(total_exp)}</div><div class='muted'>บาท</div></div><div class='stat'><b>จำนวนรายการ</b><div class='num'>{len(expenses)}</div><div class='muted'>รายการ</div></div></div>
+    <div class='card'>
+      <h3>เพิ่มรายจ่าย</h3>
+      <form method='post' action='/admin/expenses' enctype='multipart/form-data'>
+        {token_hidden}
+        <input name='title' placeholder='รายการ เช่น ค่าอาหารประชุม' required>
+        <input name='amount' placeholder='ยอดเงิน เช่น 250' required>
+        <input name='category' placeholder='หมวด เช่น อาหาร/เอกสาร/ของใช้'>
+        <input name='note' placeholder='หมายเหตุ'>
+        <label class='upload'>แนบรูปใบเสร็จ/สลิป<input type='file' name='receipt' accept='image/*' style='display:none'></label>
+        <button class='btn'>บันทึกรายจ่าย</button>
+      </form>
+      <p class='note'>ทำใน LINE ได้ด้วย: พิมพ์ “รายจ่าย ค่าอาหาร 250” แล้วส่งรูปใบเสร็จตามมา</p>
+    </div>
+    <div class='card'><h3>รายการรายจ่าย</h3>{rows}</div>
+    """
+    return page("Expenses", body)
+
+
+@app.post("/admin/expenses")
+async def admin_expenses_post(request: Request, token: str = Form(""), title: str = Form(...), amount: str = Form(...), category: str = Form(""), note: str = Form(""), receipt: UploadFile | None = File(None), db: Session = Depends(get_db)):
+    admin_ctx = require_admin(request, db, token, roles=("owner", "approver"))
+    amt = parse_amount(amount)
+    if amt is None:
+        raise HTTPException(400, detail="ยอดเงินไม่ถูกต้อง")
+    e = add_expense(db, title.strip(), amt, category=category.strip() or None, note=note.strip() or None, created_by=admin_ctx.get("name"))
+    if receipt and receipt.filename:
+        data = await receipt.read()
+        e.receipt_path = save_expense_receipt_bytes(data)
+        db.commit()
+    audit_admin(db, admin_ctx, "add_expense", detail=f"{title} {money(amt)}")
+    return RedirectResponse(f"/admin/expenses{'?token='+token if token else ''}", status_code=303)
+
+
+@app.get("/admin/expense/receipt/{expense_id}")
+def admin_expense_receipt(expense_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
+    require_admin(request, db, token)
+    e = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not e or not getattr(e, "receipt_path", None):
+        raise HTTPException(404)
+    path = Path(e.receipt_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, detail="ไม่พบไฟล์ใบเสร็จ อาจเกิดจากยังไม่ได้ผูก Railway Volume")
+    suffix = path.suffix.lower()
+    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+    return FileResponse(path, media_type=media_type, filename=path.name)
 
 
 @app.get("/admin/evidence/{payment_id}")
@@ -985,7 +1174,7 @@ def admin(request: Request, token: str = "", db: Session = Depends(get_db)):
         pending_cards += f"""
         <div class='card' id='pending'>
           <h3 style='margin:0'>📥 {p.member.name}</h3>
-          <div class='num green'>{money(p.due_amount)} บาท</div><p class='note'>ประเภท: {'เงินสด' if getattr(p, 'payment_type', '') == 'cash' else 'โอน'} • วันที่ส่ง: {p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else '-'}</p>
+          <div class='num green'>{money(p.due_amount)} บาท</div><p class='note'>ประเภท: {'เงินสด' if getattr(p, 'payment_type', '') == 'cash' else 'โอน'} • วันที่ส่ง: {format_th(p.paid_at)}</p>
           {img}
           {actions}
         </div>
@@ -1001,10 +1190,10 @@ def admin(request: Request, token: str = "", db: Session = Depends(get_db)):
         </div>
         """
     logs = db.query(AdminAuditLog).order_by(AdminAuditLog.id.desc()).limit(12).all()
-    log_html = "".join([f"<div class='member-row'><div class='avatar'>📝</div><b>{l.admin_name}</b><span>{l.action}</span><span class='note'>{l.created_at.strftime('%d/%m %H:%M')}</span></div>" for l in logs]) or "<p class='muted'>ยังไม่มีประวัติ</p>"
+    log_html = "".join([f"<div class='member-row'><div class='avatar'>📝</div><b>{l.admin_name}</b><span>{l.action}</span><span class='note'>{format_th(l.created_at, '%d/%m %H:%M')}</span></div>" for l in logs]) or "<p class='muted'>ยังไม่มีประวัติ</p>"
     body = f"""
     <div class='hero'><div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'} · เข้าระบบโดย {admin_ctx['name']} ({admin_ctx['role']})</div></div>
-    <div class='top-actions'><a class='btn2' href='/admin/admins{query}'>👥 จัดการแอดมิน</a><a class='btn2' href='/dashboard'>เปิด Dashboard</a><a class='btn2' href='/admin/logout'>ออกจากระบบ</a></div>
+    <div class='top-actions'><a class='btn2' href='/admin/admins{query}'>👥 จัดการแอดมิน</a><a class='btn2' href='/admin/expenses{query}'>🧾 รายจ่าย/ใบเสร็จ</a><a class='btn2' href='/dashboard'>เปิด Dashboard</a><a class='btn2' href='/admin/logout'>ออกจากระบบ</a></div>
     <div class='stats'>
       <div class='stat'><b>สลิปรอตรวจ</b><div class='num' style='color:#b76b00'>{len(pending)}</div><div class='muted'>รายการ</div></div>
       <div class='stat'><b>รายงาน</b><a class='btn2' href='/report.xlsx'>Excel</a><a class='btn2' href='/report.docx'>Word</a><a class='btn2' href='/report.pdf'>PDF</a></div>
@@ -1030,7 +1219,7 @@ def admin_users(request: Request, token: str = "", db: Session = Depends(get_db)
     rows = "".join([f"""
     <div class='member-row'>
       <div class='avatar'>{a.name[:1]}</div><b>{a.name}</b><span class='pill {'paid' if a.active else 'unpaid'}'>{a.role} · {'เปิดใช้' if a.active else 'ปิด'}</span>
-      <span class='note'>{a.last_login_at.strftime('%d/%m %H:%M') if a.last_login_at else '-'}</span>
+      <span class='note'>{format_th(a.last_login_at, '%d/%m %H:%M')}</span>
     </div>""" for a in admins])
     add_form = ""
     if admin_ctx["role"] == "owner":
