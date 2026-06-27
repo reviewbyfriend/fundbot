@@ -1,17 +1,16 @@
 import os
-from dotenv import load_dotenv
+from dataclasses import dataclass
 
-load_dotenv()
-
+@dataclass
 class Settings:
-    LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-    LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./fundbot.db")
-    PROMPTPAY_ID = os.getenv("PROMPTPAY_ID", "")
-    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
-    BOT_NAME = os.getenv("BOT_NAME", "FundBot")
-    PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-    SLIP_STORAGE_DIR = os.getenv("SLIP_STORAGE_DIR", "/data/slips")
-    OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./fundbot.db")
+    LINE_CHANNEL_SECRET: str = os.getenv("LINE_CHANNEL_SECRET", "")
+    LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    PROMPTPAY_ID: str = os.getenv("PROMPTPAY_ID", "")
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+    ADMIN_TOKEN: str = os.getenv("ADMIN_TOKEN", "admin123")
+    SLIP_STORAGE_DIR: str = os.getenv("SLIP_STORAGE_DIR", "/data/slips")
+    OCR_SPACE_API_KEY: str = os.getenv("OCR_SPACE_API_KEY", "")
+    BOT_NAME: str = os.getenv("BOT_NAME", "FundBot")
 
 settings = Settings()

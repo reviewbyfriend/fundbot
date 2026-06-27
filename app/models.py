@@ -1,6 +1,6 @@
-from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, ForeignKey, UniqueConstraint, Text
-from sqlalchemy.orm import relationship
 from datetime import datetime
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy.orm import relationship
 from .database import Base
 
 class Member(Base):
@@ -8,7 +8,7 @@ class Member(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(120), unique=True, index=True, nullable=False)
     default_amount = Column(Numeric(12, 2), default=0)
-    line_user_id = Column(String(80), unique=True, nullable=True)
+    line_user_id = Column(String(120), unique=True, nullable=True)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     payments = relationship("Payment", back_populates="member")
@@ -30,9 +30,10 @@ class Payment(Base):
     member_id = Column(Integer, ForeignKey("members.id"), nullable=False)
     due_amount = Column(Numeric(12, 2), default=0)
     paid_amount = Column(Numeric(12, 2), default=0)
-    status = Column(String(20), default="unpaid")  # unpaid, partial, paid
+    status = Column(String(20), default="unpaid")
     paid_at = Column(DateTime, nullable=True)
-    slip_message_id = Column(String(80), nullable=True)
+    slip_message_id = Column(String(120), nullable=True)
+    slip_path = Column(Text, nullable=True)
     note = Column(Text, nullable=True)
     round = relationship("Round", back_populates="payments")
     member = relationship("Member", back_populates="payments")
@@ -47,9 +48,3 @@ class Expense(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     note = Column(Text, nullable=True)
     round = relationship("Round", back_populates="expenses")
-
-class GroupState(Base):
-    __tablename__ = "group_states"
-    id = Column(Integer, primary_key=True)
-    group_id = Column(String(80), unique=True, nullable=False)
-    active_round_id = Column(Integer, ForeignKey("rounds.id"), nullable=True)
