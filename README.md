@@ -1,48 +1,53 @@
-# FundBot v4 Manual Approval
+# FundBot v2 Stable จาก main เดิม
 
-เวอร์ชันนี้ไม่ใช้ OCR อนุมัติอัตโนมัติแล้ว
+เวอร์ชันนี้ต่อยอดจาก `main` เดิมที่ Railway ใช้ได้ ไม่รื้อโครงใหม่ จึง deploy ได้เหมือนเดิม
 
-Flow ใหม่:
-1. สมาชิกเลือกชื่อและโอนเงิน
-2. สมาชิกอัปโหลดสลิป
-3. ระบบเปลี่ยนสถานะเป็น `รอตรวจสอบ`
-4. ระบบแจ้งแอดมินใน LINE พร้อมปุ่ม `อนุมัติ` / `ไม่ผ่าน`
-5. แอดมินกดอนุมัติแล้ว Dashboard + LINE Group อัปเดตสถานะเป็น `ชำระแล้ว`
+## ฟีเจอร์ v2 ที่เพิ่ม
+- Dashboard card UI แบบ blue/glass และสถานะ:
+  - 🔴 Not Paid
+  - 🟡 Waiting Approval
+  - 🟢 Paid (Transfer)
+  - 🟢 Paid (Cash)
+- Realtime Dashboard ผ่าน WebSocket `/ws` พร้อม fallback polling
+- หน้าชำระเงินเลือกสมาชิกแบบ card/radio
+- QR ตามยอดจาก `app/static/payment_qr/{300,500,800,1000,2500}.jpg`
+- ปุ่ม Copy PromptPay / Save QR / Open Krungthai NEXT / Open SCB EASY / Open K PLUS
+- Upload Slip พร้อม validate ไฟล์, จำกัด 8MB, compress รูป, filename เป็น UUID
+- Slip ทุกใบเป็น Waiting Approval เท่านั้น ไม่อนุมัติอัตโนมัติ
+- Cash Payment พร้อม Signature Pad และบันทึกที่ `/data/signatures/YYYY-MM/`
+- Admin `/admin?token=ADMIN_TOKEN`
+  - ดูหลักฐาน
+  - Approve
+  - Reject พร้อมเหตุผลบังคับกรอก
+- Reports:
+  - `/report.xlsx`
+  - `/report.docx`
+  - `/report.pdf`
 
 ## Railway Variables
-ต้องมี:
 
-```
+```env
 DATABASE_URL=
+ADMIN_TOKEN=
+PUBLIC_BASE_URL=
+PROMPTPAY_ID=
 LINE_CHANNEL_SECRET=
 LINE_CHANNEL_ACCESS_TOKEN=
-PROMPTPAY_ID=
-ADMIN_TOKEN=ตั้งรหัสหลังบ้าน เช่น friend123
-PUBLIC_BASE_URL=https://web-production-xxxx.up.railway.app
-```
-
-ไม่จำเป็นต้องใช้แล้ว:
-
-```
-OCR_SPACE_API_KEY
-```
-
-ใส่ก็ได้ แต่ระบบ v4 จะไม่เอา OCR มาอนุมัติอัตโนมัติ
-
-## ตัวเลือกเพิ่มเติม
-ถ้าอยากให้แจ้งเตือนไป LINE ส่วนตัว/กลุ่มแอดมินโดยเฉพาะ ให้ใส่:
-
-```
 ADMIN_NOTIFY_TARGET_ID=
+SLIP_STORAGE_DIR=/data/slips
+SIGNATURE_STORAGE_DIR=/data/signatures
 ```
 
-ถ้าไม่ใส่ ระบบจะส่งแจ้งเตือนไปที่กลุ่ม/ห้อง LINE ล่าสุดที่คุยกับบอท
+## Railway
+ใช้ Dockerfile เดิมได้เลย ไม่ต้องมี Procfile
+
+ควรผูก Railway Volume ที่ `/data` เพื่อให้สลิปและลายเซ็นไม่หายหลัง redeploy
 
 ## หน้าเว็บ
-- Dashboard: `/dashboard`
-- ชำระเงิน: `/pay`
-- หลังบ้าน: `/admin?token=ADMIN_TOKEN`
+- `/dashboard`
+- `/pay`
+- `/admin?token=ADMIN_TOKEN`
+- `/health`
 
-## หมายเหตุเรื่องเก็บสลิป
-ค่าเริ่มต้นเก็บที่ `/data/slips` และเปิดดูผ่าน `/slips/...`
-ถ้าใช้ Railway ระยะยาว ควรผูก Volume กับ path `/data` เพื่อให้รูปสลิปไม่หายหลัง redeploy
+## หมายเหตุ
+เวอร์ชันนี้ยังคงแนวทางเดิมของ main คือมี migration compatibility ใน `app/database.py` เพื่อไม่ทำข้อมูลเดิมหาย

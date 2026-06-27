@@ -34,6 +34,9 @@ class Payment(Base):
     paid_at = Column(DateTime, nullable=True)
     slip_message_id = Column(String(120), nullable=True)
     slip_path = Column(Text, nullable=True)
+    receipt_path = Column(Text, nullable=True)
+    payment_type = Column(String(20), nullable=True)  # transfer / cash
+    rejection_reason = Column(Text, nullable=True)
     note = Column(Text, nullable=True)
     round = relationship("Round", back_populates="payments")
     member = relationship("Member", back_populates="payments")

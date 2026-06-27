@@ -8,3 +8,6 @@ qrcode[pil]==8.0
 Pillow==11.0.0
 openpyxl==3.1.5
 python-dotenv==1.0.1
+
+python-docx==1.1.2
+reportlab==4.2.5

@@ -5,11 +5,13 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
+import asyncio
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -19,13 +21,16 @@ from .database import SessionLocal, get_db, init_db
 from . import services
 from .line_client import flex, reply, push, text
 from .promptpay import qr_png_base64
-from .report import make_excel
+from .report import make_excel, make_word, make_pdf
+from PIL import Image, ImageOps
 from .models import Expense, Payment, BotState
 
-app = FastAPI(title="FundBot MVP Clean")
+app = FastAPI(title="FundBot v2 Stable")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 Path(settings.SLIP_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.SIGNATURE_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
 app.mount("/slips", StaticFiles(directory=settings.SLIP_STORAGE_DIR), name="slips")
+app.mount("/signatures", StaticFiles(directory=settings.SIGNATURE_STORAGE_DIR), name="signatures")
 
 @app.on_event("startup")
 def startup():
@@ -36,7 +41,7 @@ def startup():
             services.seed_members(db)
         if not services.active_round(db):
             now = datetime.now()
-            services.open_round(db, f"มิถุนายน {now.year + 543}")
+            services.open_round(db, f"{now.strftime('%Y-%m')}")
     finally:
         db.close()
 
@@ -125,12 +130,58 @@ def slip_public_url(slip_path: str | None) -> str:
         return ""
 
 
+def signature_public_url(receipt_path: str | None) -> str:
+    if not receipt_path:
+        return ""
+    try:
+        rel = Path(receipt_path).resolve().relative_to(Path(settings.SIGNATURE_STORAGE_DIR).resolve())
+        return f"{base_url()}/signatures/{str(rel).replace(os.sep, '/')}"
+    except Exception:
+        return ""
+
+def current_month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+def save_upload_image(upload: UploadFile, folder: Path, prefix: str) -> Path:
+    content_type = (upload.content_type or "").lower()
+    if content_type not in ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif", "application/octet-stream"]:
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์รูปภาพ")
+    folder.mkdir(parents=True, exist_ok=True)
+    suffix = (Path(upload.filename or "").suffix or ".jpg").lower()
+    if suffix not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
+        suffix = ".jpg"
+    tmp = folder / f"tmp_{uuid.uuid4().hex}{suffix}"
+    with tmp.open("wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    if tmp.stat().st_size > 8 * 1024 * 1024:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="ไฟล์ใหญ่เกิน 8MB")
+    out = folder / f"{prefix}_{uuid.uuid4().hex}.jpg"
+    try:
+        img = Image.open(tmp)
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail((1600, 1600))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(out, format="JPEG", quality=82, optimize=True)
+        tmp.unlink(missing_ok=True)
+        return out
+    except Exception:
+        tmp.rename(out)
+        return out
+
+def evidence_url(payment: Payment) -> str:
+    if getattr(payment, "payment_type", "") == "cash":
+        return signature_public_url(getattr(payment, "receipt_path", None))
+    return slip_public_url(payment.slip_path)
+
+
 def notify_admin_pending_slip(db: Session, payment: Payment):
     """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
     target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
     if not target:
         return
-    slip_url = slip_public_url(payment.slip_path)
+    slip_url = evidence_url(payment)
     admin_token = settings.ADMIN_TOKEN
     approve_url = f"{base_url()}/admin/approve/{payment.id}?token={admin_token}"
     reject_url = f"{base_url()}/admin/reject/{payment.id}?token={admin_token}"
@@ -148,6 +199,7 @@ def notify_admin_pending_slip(db: Session, payment: Payment):
                 {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
                     {"type": "text", "text": f"ชื่อ: {payment.member.name}", "size": "md", "weight": "bold", "wrap": True},
                     {"type": "text", "text": f"ยอด: {money(payment.due_amount)} บาท", "size": "md", "color": "#16A34A", "weight": "bold"},
+                    {"type": "text", "text": f"ประเภท: {'เงินสด' if getattr(payment, 'payment_type', '') == 'cash' else 'โอน'}", "size": "sm", "color": "#667085"},
                     {"type": "text", "text": f"เดือน: {payment.round.title}", "size": "sm", "color": "#667085", "wrap": True},
                 ]},
             ]
@@ -222,13 +274,14 @@ def collection_flex(db: Session):
     for p in pays:
         paid = p.status == "paid"
         pending = p.status == "pending"
+        paid_cash = paid and getattr(p, "payment_type", "") == "cash"
         rows.append({
             "type": "box", "layout": "horizontal", "spacing": "sm", "paddingAll": "8px",
             "contents": [
                 {"type": "text", "text": p.member.name, "size": "sm", "weight": "bold", "flex": 4, "wrap": True, "color": "#101828"},
                 {"type": "text", "text": money(p.due_amount), "size": "sm", "align": "end", "flex": 3, "color": "#101828"},
                 {"type": "box", "layout": "vertical", "cornerRadius": "14px", "backgroundColor": "#E8F7EE" if paid else ("#FFF7E6" if pending else "#FDECEC"), "paddingAll": "6px", "flex": 4,
-                 "contents": [{"type": "text", "text": "✅ ชำระแล้ว" if paid else ("🟡 รอตรวจ" if pending else "⏰ ยังไม่ได้ชำระ"), "size": "xs", "align": "center", "weight": "bold", "color": "#148F4B" if paid else ("#B76B00" if pending else "#D93025")}]},
+                 "contents": [{"type": "text", "text": ("✅ เงินสด" if paid_cash else "✅ โอน") if paid else ("🟡 รอตรวจ" if pending else "🔴 ยังไม่จ่าย"), "size": "xs", "align": "center", "weight": "bold", "color": "#148F4B" if paid else ("#B76B00" if pending else "#D93025")}]},
             ]
         })
         rows.append({"type": "separator", "color": "#EEF2F6"})
@@ -333,9 +386,36 @@ def api_status(db: Session = Depends(get_db)):
     return {
         "round": r.title if r else "-",
         "due": float(t["due"]), "paid": float(t["paid"]), "unpaid": float(t["unpaid"]),
-        "paid_count": t["paid_count"], "unpaid_count": t["unpaid_count"], "count": t["count"],
-        "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "paid_at": p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else ""} for p in pays]
+        "paid_count": t["paid_count"], "waiting_count": len([p for p in pays if p.status == "pending"]), "unpaid_count": len([p for p in pays if p.status != "paid" and p.status != "pending"]), "count": t["count"],
+        "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else ""} for p in pays]
     }
+
+@app.websocket("/ws")
+async def websocket_status(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            db = SessionLocal()
+            try:
+                r = services.active_round(db)
+                pays = services.get_payments(db, r) if r else []
+                t = services.status_totals(db)
+                await ws.send_json({
+                    "round": r.title if r else "-",
+                    "due": float(t["due"]),
+                    "paid": float(t["paid"]),
+                    "unpaid": float(t["unpaid"]),
+                    "paid_count": t["paid_count"],
+                    "waiting_count": len([p for p in pays if p.status == "pending"]),
+                    "unpaid_count": len([p for p in pays if p.status != "paid" and p.status != "pending"]),
+                    "count": t["count"],
+                    "members": [{"id": p.member.id, "name": p.member.name, "amount": float(p.due_amount or 0), "status": p.status, "payment_type": getattr(p, "payment_type", "") or "", "paid_at": p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else ""} for p in pays],
+                })
+            finally:
+                db.close()
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        return
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -348,6 +428,7 @@ def dashboard():
     <div class='stats'>
       <div class='stat'>ยอดรวมทั้งหมด<div class='num' id='due'>-</div><div class='muted'>บาท</div></div>
       <div class='stat'>ชำระแล้ว<div class='num green' id='paid'>-</div><div class='muted' id='paidCount'>-</div></div>
+      <div class='stat'>รอตรวจ<div class='num' style='color:#b76b00' id='waitingCount'>-</div><div class='muted'>รายการ</div></div>
       <div class='stat'>ค้างชำระ<div class='num red' id='unpaid'>-</div><div class='muted' id='unpaidCount'>-</div></div>
     </div>
     <div class='leave-card'>
@@ -365,10 +446,22 @@ def dashboard():
       let r=await fetch('/api/status').then(x=>x.json());
       round.textContent='เดือน '+r.round; round2.textContent='เงินกองสำนักงาน • '+r.round;
       due.textContent=baht(r.due); paid.textContent=baht(r.paid); unpaid.textContent=baht(r.unpaid);
-      paidCount.textContent=(r.paid_count||0)+' คน'; unpaidCount.textContent=(r.unpaid_count||0)+' คน';
-      rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':((m.status=='pending'||m.status=='partial')?'partial':'unpaid')}'>${m.status=='paid'?'✅ ชำระแล้ว':(m.status=='pending'?'🟡 รอตรวจสอบ':(m.status=='partial'?'🟡 ชำระบางส่วน':'⏰ ยังไม่ได้ชำระ'))}</span></div>`).join('')
+      paidCount.textContent=(r.paid_count||0)+' คน'; waitingCount.textContent=(r.waiting_count||0); unpaidCount.textContent=(r.unpaid_count||0)+' คน';
+      rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':((m.status=='pending'||m.status=='partial')?'partial':'unpaid')}'>${m.status=='paid'?(m.payment_type=='cash'?'🟢 Paid (Cash)':'🟢 Paid (Transfer)'):(m.status=='pending'?'🟡 Waiting Approval':'🔴 Not Paid')}</span></div>`).join('')
     }
-    load();setInterval(load,3000)
+    load();
+    try{
+      const proto=location.protocol==='https:'?'wss':'ws';
+      const ws=new WebSocket(proto+'://'+location.host+'/ws');
+      ws.onmessage=(ev)=>render(JSON.parse(ev.data));
+      function render(r){
+        round.textContent='เดือน '+r.round; round2.textContent='เงินกองสำนักงาน • '+r.round;
+        due.textContent=baht(r.due); paid.textContent=baht(r.paid); unpaid.textContent=baht(r.unpaid);
+        paidCount.textContent=(r.paid_count||0)+' คน'; waitingCount.textContent=(r.waiting_count||0); unpaidCount.textContent=(r.unpaid_count||0)+' คน';
+        rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':((m.status=='pending'||m.status=='partial')?'partial':'unpaid')}'>${m.status=='paid'?(m.payment_type=='cash'?'🟢 Paid (Cash)':'🟢 Paid (Transfer)'):(m.status=='pending'?'🟡 Waiting Approval':'🔴 Not Paid')}</span></div>`).join('')
+      }
+      ws.onerror=()=>setInterval(load,3000);
+    }catch(e){setInterval(load,3000)}
     </script>
     """
     return page("Dashboard", body)
@@ -422,8 +515,11 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
       <div class='num green' style='font-size:34px'>{money(p.due_amount)} บาท</div>
       <div class='copybox'>พร้อมเพย์<br><b id='pp'>{pp}</b></div>
       <div class='bankhint'>
-        <button type='button' onclick='copyPP()'>📋 <b>Copy พร้อมเพย์</b><br><span class='note'>คัดลอกเลขพร้อมเพย์</span></button>
-        <button type='button' onclick='openBank()'>📱 <b>เปิดแอปธนาคาร</b><br><span class='note'>ลองเปิด Krungthai NEXT / แอปธนาคาร</span></button>
+        <button type='button' onclick='copyPP()'>📋 <b>Copy PromptPay</b><br><span class='note'>คัดลอกเลขพร้อมเพย์</span></button>
+        <button type='button' onclick='saveQR()'>💾 <b>Save QR Code</b><br><span class='note'>เปิดรูป QR เพื่อบันทึก</span></button>
+        <button type='button' onclick='openScheme("krungthai-next://")'>🔵 <b>Open Krungthai NEXT</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
+        <button type='button' onclick='openScheme("scbeasy://")'>🟣 <b>Open SCB EASY</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
+        <button type='button' onclick='openScheme("kplus://")'>🟢 <b>Open K PLUS</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
       </div>
       <div id='toast' class='toast'>คัดลอกพร้อมเพย์แล้ว</div>
     </div>
@@ -444,26 +540,41 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
         <button class='btn' type='submit'>อัปโหลดสลิป</button>
       </form>
     </div>
+    <div class='card'>
+      <h3 style='margin-top:0'>ชำระเงินสด</h3>
+      <div class='copybox'>
+        <b>ใบรับเงินสด</b><br>
+        ชื่อ: {m.name}<br>
+        ยอด: {money(p.due_amount)} บาท<br>
+        วันที่/เวลา: <span id='nowText'></span>
+      </div>
+      <form action='/cash/{m.id}' method='post' onsubmit='return submitCash()'>
+        <input type='hidden' name='signature_data' id='signatureData'>
+        <canvas id='sig' width='900' height='360' style='width:100%;height:180px;background:#fff;border:1px solid #d8e1ef;border-radius:18px;touch-action:none'></canvas>
+        <div class='top-actions'>
+          <button class='btn2' type='button' onclick='clearSig()'>ล้างลายเซ็น</button>
+          <button class='btn' type='submit'>Cash Payment</button>
+        </div>
+      </form>
+    </div>
     <a class='btn2' href='/pay'>กลับ</a>
     <script>
       function showToast(msg){{let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}}
       function copyPP(){{navigator.clipboard.writeText(document.getElementById('pp').innerText).then(()=>showToast('คัดลอกพร้อมเพย์แล้ว'))}}
-      function openBank(){{
-        showToast('กำลังลองเปิด Krungthai NEXT...');
-        // Public browser deep links are not guaranteed by the bank.
-        // Try common schemes first, then fall back to the official App Store page.
-        const schemes=['krungthai-next://','krungthai://','ktbnext://','ktb-next://','ktbcs.netbank://'];
-        let opened=false;
-        const start=Date.now();
-        document.addEventListener('visibilitychange',()=>{{ if(document.hidden) opened=true; }},{{once:true}});
-        let i=0;
-        function go(){{
-          if(i<schemes.length){{ location.href=schemes[i++]; setTimeout(go,600); return; }}
-          setTimeout(()=>{{ if(!opened && Date.now()-start<7000) location.href='https://apps.apple.com/th/app/krungthai-next/id436753378'; }},700);
-        }}
-        go();
-      }}
-      function previewSlip(e){{let f=e.target.files[0]; if(!f)return; let img=document.getElementById('preview'); img.src=URL.createObjectURL(f); img.style.display='block'}}
+      function openScheme(scheme){{ try{{ location.href=scheme; }}catch(e){{}} }}
+      function saveQR(){{ let img=document.querySelector('.qr'); if(img) window.open(img.src,'_blank'); else showToast('ยังไม่มีรูป QR') }}
+      document.getElementById('nowText').textContent=new Date().toLocaleString('th-TH');
+      const canvas=document.getElementById('sig'), ctx=canvas.getContext('2d'); let drawing=false, signed=false;
+      ctx.lineWidth=5; ctx.lineCap='round'; ctx.strokeStyle='#101828';
+      function pos(e){{ const r=canvas.getBoundingClientRect(); const t=e.touches?e.touches[0]:e; return {{x:(t.clientX-r.left)*canvas.width/r.width,y:(t.clientY-r.top)*canvas.height/r.height}}; }}
+      function start(e){{ drawing=true; signed=true; const p=pos(e); ctx.beginPath(); ctx.moveTo(p.x,p.y); e.preventDefault(); }}
+      function move(e){{ if(!drawing)return; const p=pos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); e.preventDefault(); }}
+      function end(){{ drawing=false; }}
+      canvas.addEventListener('mousedown',start); canvas.addEventListener('mousemove',move); window.addEventListener('mouseup',end);
+      canvas.addEventListener('touchstart',start,{{passive:false}}); canvas.addEventListener('touchmove',move,{{passive:false}}); canvas.addEventListener('touchend',end);
+      function clearSig(){{ ctx.clearRect(0,0,canvas.width,canvas.height); signed=false; }}
+      function submitCash(){{ if(!signed){{showToast('กรุณาเซ็นชื่อก่อน'); return false;}} document.getElementById('signatureData').value=canvas.toDataURL('image/png'); return true; }}
+      function previewSlip(e){{let f=e.target.files[0]; if(!f)return; if(f.size>8*1024*1024){{showToast('ไฟล์ใหญ่เกิน 8MB'); e.target.value=''; return;}} let img=document.getElementById('preview'); img.src=URL.createObjectURL(f); img.style.display='block'}}
     </script>
     """
     return page("ชำระเงิน", body)
@@ -476,18 +587,15 @@ async def upload_slip(member_id: int, slip: UploadFile = File(...), db: Session 
     r = services.active_round(db); m = services.member_by_id(db, member_id)
     if not r or not m: raise HTTPException(404)
     p = services.ensure_payment(db, r, m)
-    month_dir = Path(settings.SLIP_STORAGE_DIR) / safe_name(r.title)
-    month_dir.mkdir(parents=True, exist_ok=True)
-    ext = os.path.splitext(slip.filename or '')[1].lower() or '.jpg'
-    if ext not in ['.jpg', '.jpeg', '.png', '.webp']:
-        ext = '.jpg'
-    out = month_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name(m.name)}{ext}"
-    with out.open('wb') as f:
-        shutil.copyfileobj(slip.file, f)
+    month_dir = Path(settings.SLIP_STORAGE_DIR) / current_month_key()
+    out = save_upload_image(slip, month_dir, f"slip_{safe_name(m.name)}")
 
-    # ไม่ใช้ OCR แล้ว: ทุกสลิปจะเข้าคิวรอตรวจสอบ ให้แอดมินกดอนุมัติเอง
+    # v2: NEVER auto approve. All evidence waits for admin approval.
     p.slip_path = str(out)
-    p.note = f"slip:{out}\nรอแอดมินตรวจสอบ"
+    p.receipt_path = None
+    p.payment_type = "transfer"
+    p.rejection_reason = None
+    p.note = f"transfer_slip:{out}\nรอแอดมินตรวจสอบ"
     p.status = "pending"
     p.paid_amount = Decimal("0")
     p.paid_at = None
@@ -497,6 +605,35 @@ async def upload_slip(member_id: int, slip: UploadFile = File(...), db: Session 
     update_line_summary(db)
     return page("รอตรวจสอบสลิป", f"<div class='card' style='text-align:center'><div style='font-size:70px'>🟡</div><h2>ส่งสลิปแล้ว รอตรวจสอบ</h2><p>{m.name}</p><div class='num' style='color:#b76b00'>{money(p.due_amount)} บาท</div><p class='sub'>ระบบบันทึกรูปสลิปไว้แล้ว และแจ้งแอดมินเพื่อตรวจสอบ</p><p class='note'>สถานะจะเปลี่ยนเป็นชำระแล้ว หลังแอดมินกดอนุมัติ</p><a class='btn' href='/dashboard'>กลับหน้ารายการ</a></div>")
 
+
+@app.post("/cash/{member_id}", response_class=HTMLResponse)
+async def cash_payment(member_id: int, signature_data: str = Form(...), db: Session = Depends(get_db)):
+    r = services.active_round(db); m = services.member_by_id(db, member_id)
+    if not r or not m: raise HTTPException(404)
+    if not signature_data.startswith("data:image/png;base64,"):
+        raise HTTPException(400, detail="signature required")
+    p = services.ensure_payment(db, r, m)
+    month_dir = Path(settings.SIGNATURE_STORAGE_DIR) / current_month_key()
+    month_dir.mkdir(parents=True, exist_ok=True)
+    raw = base64.b64decode(signature_data.split(",", 1)[1])
+    if len(raw) > 3 * 1024 * 1024:
+        raise HTTPException(400, detail="signature too large")
+    out = month_dir / f"cash_{safe_name(m.name)}_{uuid.uuid4().hex}.png"
+    out.write_bytes(raw)
+    p.receipt_path = str(out)
+    p.slip_path = None
+    p.payment_type = "cash"
+    p.rejection_reason = None
+    p.status = "pending"
+    p.paid_amount = Decimal("0")
+    p.paid_at = None
+    p.note = f"cash_receipt:{out}\nรอแอดมินตรวจสอบ"
+    db.commit()
+    db.refresh(p)
+    notify_admin_pending_slip(db, p)
+    update_line_summary(db)
+    return page("รอตรวจสอบเงินสด", f"<div class='card' style='text-align:center'><div style='font-size:70px'>🟡</div><h2>ส่งใบรับเงินสดแล้ว รอตรวจสอบ</h2><p>{m.name}</p><div class='num' style='color:#b76b00'>{money(p.due_amount)} บาท</div><p class='sub'>แอดมินต้องกดอนุมัติก่อน สถานะจึงจะเป็น Paid (Cash)</p><a class='btn' href='/dashboard'>กลับหน้ารายการ</a></div>")
+
 @app.get("/report.xlsx")
 def report_xlsx(db: Session = Depends(get_db)):
     r = services.active_round(db)
@@ -504,6 +641,20 @@ def report_xlsx(db: Session = Depends(get_db)):
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
     expenses = db.query(Expense).filter(Expense.round_id == r.id).all()
     return Response(make_excel(r, payments, expenses), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=fundbot_report.xlsx"})
+
+@app.get("/report.docx")
+def report_docx(db: Session = Depends(get_db)):
+    r = services.active_round(db)
+    if not r: raise HTTPException(404)
+    payments = db.query(Payment).filter(Payment.round_id == r.id).all()
+    return Response(make_word(r, payments), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition":"attachment; filename=fundbot_report.docx"})
+
+@app.get("/report.pdf")
+def report_pdf(db: Session = Depends(get_db)):
+    r = services.active_round(db)
+    if not r: raise HTTPException(404)
+    payments = db.query(Payment).filter(Payment.round_id == r.id).all()
+    return Response(make_pdf(r, payments), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=fundbot_report.pdf"})
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin(token: str = "", db: Session = Depends(get_db)):
@@ -515,16 +666,20 @@ def admin(token: str = "", db: Session = Depends(get_db)):
     rows = "".join([f"<div class='member-row'><div class='avatar'>{p.member.name.replace('ท่าน','').strip()[:1] or '?'}</div><b>{p.member.name}</b><b style='text-align:right'>{money(p.due_amount)}</b><span class='status pill {'paid' if p.status=='paid' else ('partial' if p.status=='pending' else 'unpaid')}'>{'✅ ชำระแล้ว' if p.status=='paid' else ('🟡 รอตรวจ' if p.status=='pending' else 'ยังไม่ชำระ')}</span></div>" for p in pays])
     pending_cards = ""
     for p in pending:
-        slip_url = slip_public_url(p.slip_path)
-        img = f"<img src='{slip_url}' style='width:100%;border-radius:18px;border:1px solid #e6eaf2;margin:10px 0'>" if slip_url else "<div class='note'>ไม่มีรูปสลิป</div>"
+        slip_url = evidence_url(p)
+        img = f"<img src='{slip_url}' style='width:100%;border-radius:18px;border:1px solid #e6eaf2;margin:10px 0'>" if slip_url else "<div class='note'>ไม่มีหลักฐาน</div>"
         pending_cards += f"""
         <div class='card' id='pending'>
           <h3 style='margin:0'>📥 {p.member.name}</h3>
-          <div class='num green'>{money(p.due_amount)} บาท</div>
+          <div class='num green'>{money(p.due_amount)} บาท</div><p class='note'>ประเภท: {'เงินสด' if getattr(p, 'payment_type', '') == 'cash' else 'โอน'} • วันที่ส่ง: {p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else '-'}</p>
           {img}
           <div class='top-actions'>
             <a class='btn' href='/admin/approve/{p.id}?token={token}'>✅ อนุมัติ</a>
-            <a class='btn2' href='/admin/reject/{p.id}?token={token}'>❌ ไม่ผ่าน</a>
+            <form action='/admin/reject/{p.id}' method='post' style='flex:1'>
+              <input type='hidden' name='token' value='{token}'>
+              <input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'>
+              <button class='btn2' type='submit'>❌ Reject</button>
+            </form>
           </div>
         </div>
         """
@@ -534,7 +689,7 @@ def admin(token: str = "", db: Session = Depends(get_db)):
     <div class='hero'><div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'}</div></div>
     <div class='stats'>
       <div class='stat'><b>สลิปรอตรวจ</b><div class='num' style='color:#b76b00'>{len(pending)}</div><div class='muted'>รายการ</div></div>
-      <div class='stat'><b>รายงาน</b><a class='btn2' href='/report.xlsx'>ดาวน์โหลด Excel</a></div>
+      <div class='stat'><b>รายงาน</b><a class='btn2' href='/report.xlsx'>Excel</a><a class='btn2' href='/report.docx'>Word</a><a class='btn2' href='/report.pdf'>PDF</a></div>
       <div class='stat'><b>Dashboard</b><a class='btn2' href='/dashboard'>เปิดหน้า Dashboard</a></div>
     </div>
     {pending_cards}
@@ -556,15 +711,29 @@ def admin_approve(payment_id: int, token: str = "", db: Session = Depends(get_db
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
+    ptype = getattr(p, "payment_type", "") or ("cash" if getattr(p, "receipt_path", None) else "transfer")
     services.mark_member_paid(db, p.member_id, Decimal(p.due_amount or 0), note=(p.note or "") + "\nadmin_approved", slip_path=p.slip_path)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    p.payment_type = ptype
+    p.rejection_reason = None
+    db.commit()
     update_line_summary(db)
     target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
     if target:
         push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท")])
     return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
 
-@app.get("/admin/reject/{payment_id}")
-def admin_reject(payment_id: int, token: str = "", db: Session = Depends(get_db)):
+@app.get("/admin/reject/{payment_id}", response_class=HTMLResponse)
+def admin_reject_form(payment_id: int, token: str = "", db: Session = Depends(get_db)):
+    if token != settings.ADMIN_TOKEN:
+        raise HTTPException(403)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    return page("Reject", f"<div class='card'><h2>Reject: {p.member.name}</h2><form method='post' action='/admin/reject/{p.id}'><input type='hidden' name='token' value='{token}'><input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'><button class='btn'>บันทึก Reject</button></form></div>")
+
+@app.post("/admin/reject/{payment_id}")
+def admin_reject(payment_id: int, token: str = Form(...), reason: str = Form(...), db: Session = Depends(get_db)):
     if token != settings.ADMIN_TOKEN:
         raise HTTPException(403)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
@@ -573,12 +742,13 @@ def admin_reject(payment_id: int, token: str = "", db: Session = Depends(get_db)
     p.status = "unpaid"
     p.paid_amount = Decimal("0")
     p.paid_at = None
-    p.note = (p.note or "") + "\nadmin_rejected"
+    p.rejection_reason = reason.strip()
+    p.note = (p.note or "") + f"\nadmin_rejected:{reason.strip()}"
     db.commit()
     update_line_summary(db)
     target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
     if target:
-        push(target, [text(f"❌ ไม่ผ่าน: {p.member.name} กรุณาอัปโหลดสลิปใหม่")])
+        push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nกรุณาอัปโหลดใหม่")])
     return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
 
 @app.post("/admin/open")

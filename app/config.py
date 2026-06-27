@@ -10,6 +10,7 @@ class Settings:
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     ADMIN_TOKEN: str = os.getenv("ADMIN_TOKEN", "admin123")
     SLIP_STORAGE_DIR: str = os.getenv("SLIP_STORAGE_DIR", "/data/slips")
+    SIGNATURE_STORAGE_DIR: str = os.getenv("SIGNATURE_STORAGE_DIR", "/data/signatures")
     OCR_SPACE_API_KEY: str = os.getenv("OCR_SPACE_API_KEY", "")
     # Optional: LINE user/group/room id ที่จะให้บอทแจ้งเตือนสลิปรอตรวจ
     # ถ้าไม่ใส่ ระบบจะส่งแจ้งเตือนไปที่กลุ่ม/ห้อง LINE ล่าสุดที่คุยกับบอท

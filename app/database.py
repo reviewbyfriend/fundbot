@@ -97,6 +97,9 @@ def migrate_db():
         _add_col(conn, "payments", "paid_at", ts)
         _add_col(conn, "payments", "slip_message_id", "VARCHAR(120)")
         _add_col(conn, "payments", "slip_path", "TEXT")
+        _add_col(conn, "payments", "receipt_path", "TEXT")
+        _add_col(conn, "payments", "payment_type", "VARCHAR(20)")
+        _add_col(conn, "payments", "rejection_reason", "TEXT")
         _add_col(conn, "payments", "note", "TEXT")
         if _has_table(conn, "payments"):
             cols = _cols(conn, "payments")
