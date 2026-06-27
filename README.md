@@ -1,61 +1,58 @@
-# FundBot Group UI
+# FundBot Office Collection
 
-บอท LINE กลุ่มสำหรับเก็บเงินกองกลางรายเดือน แบบใช้งานง่าย มีหน้า Admin UI และคำสั่งใน LINE
+เวอร์ชันนี้เน้นใช้งานตามโจทย์ล่าสุด:
 
-## ใช้กับ Railway
+- ส่งหน้าเก็บเงินใน LINE กลุ่มแบบครั้งเดียว
+- รายการสมาชิก 7 คน + ยอดรายคน
+- สถานะ `ชำระแล้ว / ยังไม่ได้ชำระ`
+- ปุ่มชำระเงินเปิดหน้าเว็บให้เลือกชื่อ
+- แสดง QR PromptPay / copy พร้อมเพย์
+- อัปโหลดสลิปผ่านเว็บ
+- Dashboard อัปเดตอัตโนมัติทุก 3 วินาที ไม่ต้องสแปม LINE กลุ่ม
+- เก็บไฟล์สลิปแยกตามโฟลเดอร์เดือน เช่น `/data/slips/มิถุนายน_2569/`
 
-Variables ที่ต้องมีใน Railway → web → Variables
-
-```text
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-LINE_CHANNEL_SECRET=จาก LINE Developers
-LINE_CHANNEL_ACCESS_TOKEN=จาก LINE Developers
-PROMPTPAY_ID=เบอร์/เลขพร้อมเพย์ที่รับเงิน
-ADMIN_TOKEN=ตั้งรหัสเอง เช่น friend1234
-PUBLIC_BASE_URL=https://web-production-1b96.up.railway.app
-```
-
-Webhook URL ใน LINE Developers:
-
-```text
-https://web-production-1b96.up.railway.app/webhook
-```
-
-Admin UI:
-
-```text
-https://web-production-1b96.up.railway.app/admin?token=รหัสที่ตั้งใน ADMIN_TOKEN
-```
-
-## คำสั่งใน LINE กลุ่ม
+## คำสั่งใน LINE
 
 ```text
 เมนู
-เพิ่มสมาชิก รักษิน 500
-เปิดรอบ กรกฎาคม 2569 ยกมา 17813.50
-ลงทะเบียน รักษิน
-สถานะ
+ส่งหน้าเก็บเงิน
 ชำระเงิน
-จ่ายแล้ว 500
-รายจ่าย ค่าน้ำ 350
+สถานะ
 สรุป
-ใครยังไม่จ่าย
-ทวงเงิน
-รายงาน
+เปิดรอบ กรกฎาคม 2569
+เพิ่มสมาชิก ท่านรักษิน 500
 ```
 
-## วิธีใช้งานจริงเร็วสุด
+## URL สำคัญ
 
-1. อัปไฟล์ทั้งหมดขึ้น GitHub ทับ repo เดิม
-2. Railway จะ deploy อัตโนมัติ
-3. ตั้ง Variables ให้ครบ
-4. ใส่ Webhook URL ใน LINE Developers
-5. ลากบอทเข้า LINE กลุ่ม
-6. พิมพ์ `เมนู`
+```text
+/dashboard
+/pay
+/admin?token=ADMIN_TOKEN
+/webhook
+```
 
-## หมายเหตุ
+## Variables ใน Railway
 
-เวอร์ชันนี้เน้นใช้ได้จริงด่วน:
-- มี QR PromptPay ให้สแกน
-- รับรูปสลิปได้ แต่ยังให้พิมพ์ `จ่ายแล้ว 500` เพื่อยืนยันยอด
-- OCR สลิปอัตโนมัติ 100% จะเพิ่มในเวอร์ชันถัดไป
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+LINE_CHANNEL_SECRET=...
+LINE_CHANNEL_ACCESS_TOKEN=...
+PROMPTPAY_ID=เบอร์พร้อมเพย์
+ADMIN_TOKEN=ตั้งรหัสหลังบ้าน
+PUBLIC_BASE_URL=https://web-production-1b96.up.railway.app
+SLIP_STORAGE_DIR=/data/slips
+OCR_SPACE_API_KEY=เว้นว่างได้
+```
+
+หมายเหตุ: ถ้าไม่ใส่ `OCR_SPACE_API_KEY` ระบบจะเก็บสลิปและเปลี่ยนสถานะตามชื่อที่เลือกทันที เพื่อให้ใช้งานด่วนได้ก่อน หากใส่ OCR key จะตรวจยอดจากรูปเบื้องต้นด้วย
+
+## Railway Start Command
+
+ถ้า Railway มี Custom Start Command ให้ใช้:
+
+```text
+sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+```
+
+หรือปล่อยว่างให้ Dockerfile ทำงานแทน

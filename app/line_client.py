@@ -35,3 +35,7 @@ def get_message_content(message_id: str) -> bytes | None:
     if r.ok:
         return r.content
     return None
+
+
+def flex(alt_text: str, contents: dict) -> dict:
+    return {"type": "flex", "altText": alt_text[:400], "contents": contents}
