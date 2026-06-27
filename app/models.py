@@ -48,3 +48,10 @@ class Expense(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     note = Column(Text, nullable=True)
     round = relationship("Round", back_populates="expenses")
+
+
+class BotState(Base):
+    __tablename__ = "bot_state"
+    key = Column(String(120), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

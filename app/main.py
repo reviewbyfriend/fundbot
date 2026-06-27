@@ -4,6 +4,7 @@ import hmac
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -16,13 +17,15 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .database import SessionLocal, get_db, init_db
 from . import services
-from .line_client import flex, reply, text
+from .line_client import flex, reply, push, text
 from .promptpay import qr_png_base64
 from .report import make_excel
-from .models import Expense, Payment
+from .models import Expense, Payment, BotState
 
 app = FastAPI(title="FundBot MVP Clean")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+Path(settings.SLIP_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+app.mount("/slips", StaticFiles(directory=settings.SLIP_STORAGE_DIR), name="slips")
 
 @app.on_event("startup")
 def startup():
@@ -81,19 +84,151 @@ def bank_qr_url(amount):
         return f"/static/payment_qr/{key}.jpg"
     return None
 
+def set_state(db: Session, key: str, value: str | None):
+    st = db.query(BotState).filter(BotState.key == key).first()
+    if not st:
+        st = BotState(key=key, value=value)
+        db.add(st)
+    else:
+        st.value = value
+    db.commit()
+
+
+def get_state(db: Session, key: str) -> str | None:
+    st = db.query(BotState).filter(BotState.key == key).first()
+    return st.value if st else None
+
+
+def save_line_target(db: Session, event: dict):
+    source = event.get("source", {}) or {}
+    target = source.get("groupId") or source.get("roomId") or source.get("userId")
+    if target:
+        set_state(db, "line_target_id", target)
+
+
+def update_line_summary(db: Session):
+    """LINE messages cannot be edited after sending, so push a fresh updated card."""
+    target = get_state(db, "line_target_id")
+    if target:
+        push(target, [collection_flex(db)])
+
+
+
+
+def slip_public_url(slip_path: str | None) -> str:
+    if not slip_path:
+        return ""
+    try:
+        rel = Path(slip_path).resolve().relative_to(Path(settings.SLIP_STORAGE_DIR).resolve())
+        return f"{base_url()}/slips/{str(rel).replace(os.sep, '/')}"
+    except Exception:
+        return ""
+
+
+def notify_admin_pending_slip(db: Session, payment: Payment):
+    """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
+    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    if not target:
+        return
+    slip_url = slip_public_url(payment.slip_path)
+    admin_token = settings.ADMIN_TOKEN
+    approve_url = f"{base_url()}/admin/approve/{payment.id}?token={admin_token}"
+    reject_url = f"{base_url()}/admin/reject/{payment.id}?token={admin_token}"
+    view_url = f"{base_url()}/admin?token={admin_token}#pending"
+    contents = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "📥 มีสลิปรอตรวจ", "weight": "bold", "size": "xl", "color": "#101828"},
+                {"type": "separator", "color": "#E4E7EC"},
+                {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+                    {"type": "text", "text": f"ชื่อ: {payment.member.name}", "size": "md", "weight": "bold", "wrap": True},
+                    {"type": "text", "text": f"ยอด: {money(payment.due_amount)} บาท", "size": "md", "color": "#16A34A", "weight": "bold"},
+                    {"type": "text", "text": f"เดือน: {payment.round.title}", "size": "sm", "color": "#667085", "wrap": True},
+                ]},
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#16A34A", "action": {"type": "uri", "label": "✅ อนุมัติ", "uri": approve_url}},
+                {"type": "button", "style": "secondary", "action": {"type": "uri", "label": "🖼 ดูสลิป/หลังบ้าน", "uri": view_url}},
+                {"type": "button", "style": "link", "color": "#DC2626", "action": {"type": "uri", "label": "❌ ไม่ผ่าน", "uri": reject_url}},
+            ]
+        }
+    }
+    if slip_url:
+        contents["hero"] = {"type": "image", "url": slip_url, "size": "full", "aspectRatio": "16:10", "aspectMode": "cover"}
+    push(target, [flex("มีสลิปรอตรวจ", contents)])
+
+def ocr_space_text(image_path: Path) -> str:
+    if not settings.OCR_SPACE_API_KEY:
+        return ""
+    try:
+        import requests
+        with image_path.open("rb") as f:
+            resp = requests.post(
+                "https://api.ocr.space/parse/image",
+                files={"filename": f},
+                data={"apikey": settings.OCR_SPACE_API_KEY, "language": "eng", "OCREngine": "2", "isOverlayRequired": "false"},
+                timeout=25,
+            )
+        js = resp.json()
+        parts = []
+        for item in js.get("ParsedResults", []) or []:
+            parts.append(item.get("ParsedText") or "")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def amounts_from_text(txt: str) -> list[Decimal]:
+    vals = []
+    # Find money-looking numbers. Handles 500.00, 1,000.00, 2500.00.
+    for raw in re.findall(r"(?<!\d)(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{3,5}(?:\.\d{2})?)(?!\d)", txt or ""):
+        try:
+            vals.append(Decimal(raw.replace(",", "")))
+        except Exception:
+            pass
+    return vals
+
+
+def verify_slip_amount(image_path: Path, expected: Decimal) -> tuple[str, str, Decimal | None]:
+    """Return status: paid / pending / rejected.
+    We only mark paid if OCR confidently finds the exact expected amount.
+    If OCR is not configured or cannot read, keep pending for admin review.
+    """
+    expected = Decimal(expected or 0).quantize(Decimal("0.01"))
+    if not settings.OCR_SPACE_API_KEY:
+        return "pending", "ยังไม่ได้ตั้ง OCR_SPACE_API_KEY จึงเก็บสลิปไว้รอตรวจสอบ ไม่ปรับเป็นชำระแล้วอัตโนมัติ", None
+    txt = ocr_space_text(image_path)
+    vals = [v.quantize(Decimal("0.01")) for v in amounts_from_text(txt)]
+    if expected in vals:
+        return "paid", f"OCR พบยอด {money(expected)} บาท ตรงกับยอดที่ต้องชำระ", expected
+    if vals:
+        return "rejected", f"ยอดในสลิปไม่ตรง ระบบอ่านได้: {', '.join(money(v) for v in vals[:6])} บาท / ต้องชำระ {money(expected)} บาท", vals[0]
+    return "pending", "OCR อ่านยอดเงินไม่ได้ จึงเก็บสลิปไว้รอตรวจสอบ ไม่ปรับเป็นชำระแล้วอัตโนมัติ", None
+
 def collection_flex(db: Session):
     r = services.active_round(db)
     pays = services.get_payments(db, r) if r else []
     rows = []
     for p in pays:
         paid = p.status == "paid"
+        pending = p.status == "pending"
         rows.append({
             "type": "box", "layout": "horizontal", "spacing": "sm", "paddingAll": "8px",
             "contents": [
                 {"type": "text", "text": p.member.name, "size": "sm", "weight": "bold", "flex": 4, "wrap": True, "color": "#101828"},
                 {"type": "text", "text": money(p.due_amount), "size": "sm", "align": "end", "flex": 3, "color": "#101828"},
-                {"type": "box", "layout": "vertical", "cornerRadius": "14px", "backgroundColor": "#E8F7EE" if paid else "#FDECEC", "paddingAll": "6px", "flex": 4,
-                 "contents": [{"type": "text", "text": "✅ ชำระแล้ว" if paid else "⏰ ยังไม่ได้ชำระ", "size": "xs", "align": "center", "weight": "bold", "color": "#148F4B" if paid else "#D93025"}]},
+                {"type": "box", "layout": "vertical", "cornerRadius": "14px", "backgroundColor": "#E8F7EE" if paid else ("#FFF7E6" if pending else "#FDECEC"), "paddingAll": "6px", "flex": 4,
+                 "contents": [{"type": "text", "text": "✅ ชำระแล้ว" if paid else ("🟡 รอตรวจ" if pending else "⏰ ยังไม่ได้ชำระ"), "size": "xs", "align": "center", "weight": "bold", "color": "#148F4B" if paid else ("#B76B00" if pending else "#D93025")}]},
             ]
         })
         rows.append({"type": "separator", "color": "#EEF2F6"})
@@ -117,6 +252,12 @@ async def webhook(req: Request):
         raise HTTPException(status_code=400, detail="invalid signature")
     data = await req.json()
     for ev in data.get("events", []):
+        # Remember the latest group/room/user target so upload can send a fresh updated card.
+        dbtmp = SessionLocal()
+        try:
+            save_line_target(dbtmp, ev)
+        finally:
+            dbtmp.close()
         if ev.get("type") != "message":
             continue
         token = ev.get("replyToken")
@@ -225,7 +366,7 @@ def dashboard():
       round.textContent='เดือน '+r.round; round2.textContent='เงินกองสำนักงาน • '+r.round;
       due.textContent=baht(r.due); paid.textContent=baht(r.paid); unpaid.textContent=baht(r.unpaid);
       paidCount.textContent=(r.paid_count||0)+' คน'; unpaidCount.textContent=(r.unpaid_count||0)+' คน';
-      rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':(m.status=='partial'?'partial':'unpaid')}'>${m.status=='paid'?'✅ ชำระแล้ว':(m.status=='partial'?'🟡 ชำระบางส่วน':'⏰ ยังไม่ได้ชำระ')}</span></div>`).join('')
+      rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':((m.status=='pending'||m.status=='partial')?'partial':'unpaid')}'>${m.status=='paid'?'✅ ชำระแล้ว':(m.status=='pending'?'🟡 รอตรวจสอบ':(m.status=='partial'?'🟡 ชำระบางส่วน':'⏰ ยังไม่ได้ชำระ'))}</span></div>`).join('')
     }
     load();setInterval(load,3000)
     </script>
@@ -308,10 +449,18 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
       function showToast(msg){{let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}}
       function copyPP(){{navigator.clipboard.writeText(document.getElementById('pp').innerText).then(()=>showToast('คัดลอกพร้อมเพย์แล้ว'))}}
       function openBank(){{
-        showToast('กำลังลองเปิดแอปธนาคาร...');
-        let schemes=['krungthai-next://','krungthai://','scbeasy://','kplus://'];
+        showToast('กำลังลองเปิด Krungthai NEXT...');
+        // Public browser deep links are not guaranteed by the bank.
+        // Try common schemes first, then fall back to the official App Store page.
+        const schemes=['krungthai-next://','krungthai://','ktbnext://','ktb-next://','ktbcs.netbank://'];
+        let opened=false;
+        const start=Date.now();
+        document.addEventListener('visibilitychange',()=>{{ if(document.hidden) opened=true; }},{{once:true}});
         let i=0;
-        function go(){{ if(i<schemes.length){{ location.href=schemes[i++]; setTimeout(go,700); }} }}
+        function go(){{
+          if(i<schemes.length){{ location.href=schemes[i++]; setTimeout(go,600); return; }}
+          setTimeout(()=>{{ if(!opened && Date.now()-start<7000) location.href='https://apps.apple.com/th/app/krungthai-next/id436753378'; }},700);
+        }}
         go();
       }}
       function previewSlip(e){{let f=e.target.files[0]; if(!f)return; let img=document.getElementById('preview'); img.src=URL.createObjectURL(f); img.style.display='block'}}
@@ -330,11 +479,23 @@ async def upload_slip(member_id: int, slip: UploadFile = File(...), db: Session 
     month_dir = Path(settings.SLIP_STORAGE_DIR) / safe_name(r.title)
     month_dir.mkdir(parents=True, exist_ok=True)
     ext = os.path.splitext(slip.filename or '')[1].lower() or '.jpg'
+    if ext not in ['.jpg', '.jpeg', '.png', '.webp']:
+        ext = '.jpg'
     out = month_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name(m.name)}{ext}"
     with out.open('wb') as f:
         shutil.copyfileobj(slip.file, f)
-    services.mark_member_paid(db, m.id, Decimal(p.due_amount or 0), note=f"slip:{out}", slip_path=str(out))
-    return page("ชำระแล้ว", f"<div class='card' style='text-align:center'><div style='font-size:70px'>✅</div><h2>ชำระเงินเรียบร้อยแล้ว</h2><p>{m.name}</p><div class='num green'>{money(p.due_amount)} บาท</div><p class='sub'>เก็บสลิปไว้ที่โฟลเดอร์ {r.title}</p><a class='btn' href='/dashboard'>กลับหน้ารายการ</a></div>")
+
+    # ไม่ใช้ OCR แล้ว: ทุกสลิปจะเข้าคิวรอตรวจสอบ ให้แอดมินกดอนุมัติเอง
+    p.slip_path = str(out)
+    p.note = f"slip:{out}\nรอแอดมินตรวจสอบ"
+    p.status = "pending"
+    p.paid_amount = Decimal("0")
+    p.paid_at = None
+    db.commit()
+    db.refresh(p)
+    notify_admin_pending_slip(db, p)
+    update_line_summary(db)
+    return page("รอตรวจสอบสลิป", f"<div class='card' style='text-align:center'><div style='font-size:70px'>🟡</div><h2>ส่งสลิปแล้ว รอตรวจสอบ</h2><p>{m.name}</p><div class='num' style='color:#b76b00'>{money(p.due_amount)} บาท</div><p class='sub'>ระบบบันทึกรูปสลิปไว้แล้ว และแจ้งแอดมินเพื่อตรวจสอบ</p><p class='note'>สถานะจะเปลี่ยนเป็นชำระแล้ว หลังแอดมินกดอนุมัติ</p><a class='btn' href='/dashboard'>กลับหน้ารายการ</a></div>")
 
 @app.get("/report.xlsx")
 def report_xlsx(db: Session = Depends(get_db)):
@@ -350,9 +511,75 @@ def admin(token: str = "", db: Session = Depends(get_db)):
         raise HTTPException(403)
     r = services.active_round(db)
     pays = services.get_payments(db, r) if r else []
-    rows = "".join([f"<div class='row'><b>{p.member.name}</b><span>{money(p.due_amount)}</span><span class='pill {'paid' if p.status=='paid' else 'unpaid'}'>{'ชำระแล้ว' if p.status=='paid' else 'ยังไม่ชำระ'}</span></div>" for p in pays])
-    body = f"<div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'}</div><div class='card'><a class='btn2' href='/report.xlsx'>ดาวน์โหลด Excel</a>{rows}</div><div class='card'><h3>เปิดรอบใหม่</h3><form action='/admin/open' method='post'><input type='hidden' name='token' value='{token}'><input name='title' placeholder='กรกฎาคม 2569'><button class='btn'>เปิดรอบ</button></form></div><div class='card'><h3>เพิ่ม/แก้สมาชิก</h3><form action='/admin/member' method='post'><input type='hidden' name='token' value='{token}'><input name='name' placeholder='ชื่อ'><input name='amount' placeholder='ยอด'><button class='btn'>บันทึก</button></form></div>"
+    pending = [p for p in pays if p.status == "pending"]
+    rows = "".join([f"<div class='member-row'><div class='avatar'>{p.member.name.replace('ท่าน','').strip()[:1] or '?'}</div><b>{p.member.name}</b><b style='text-align:right'>{money(p.due_amount)}</b><span class='status pill {'paid' if p.status=='paid' else ('partial' if p.status=='pending' else 'unpaid')}'>{'✅ ชำระแล้ว' if p.status=='paid' else ('🟡 รอตรวจ' if p.status=='pending' else 'ยังไม่ชำระ')}</span></div>" for p in pays])
+    pending_cards = ""
+    for p in pending:
+        slip_url = slip_public_url(p.slip_path)
+        img = f"<img src='{slip_url}' style='width:100%;border-radius:18px;border:1px solid #e6eaf2;margin:10px 0'>" if slip_url else "<div class='note'>ไม่มีรูปสลิป</div>"
+        pending_cards += f"""
+        <div class='card' id='pending'>
+          <h3 style='margin:0'>📥 {p.member.name}</h3>
+          <div class='num green'>{money(p.due_amount)} บาท</div>
+          {img}
+          <div class='top-actions'>
+            <a class='btn' href='/admin/approve/{p.id}?token={token}'>✅ อนุมัติ</a>
+            <a class='btn2' href='/admin/reject/{p.id}?token={token}'>❌ ไม่ผ่าน</a>
+          </div>
+        </div>
+        """
+    if not pending_cards:
+        pending_cards = "<div class='card' id='pending'><h3>📥 สลิปรอตรวจ</h3><p class='muted'>ยังไม่มีสลิปรอตรวจ</p></div>"
+    body = f"""
+    <div class='hero'><div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'}</div></div>
+    <div class='stats'>
+      <div class='stat'><b>สลิปรอตรวจ</b><div class='num' style='color:#b76b00'>{len(pending)}</div><div class='muted'>รายการ</div></div>
+      <div class='stat'><b>รายงาน</b><a class='btn2' href='/report.xlsx'>ดาวน์โหลด Excel</a></div>
+      <div class='stat'><b>Dashboard</b><a class='btn2' href='/dashboard'>เปิดหน้า Dashboard</a></div>
+    </div>
+    {pending_cards}
+    <div class='leave-card'>
+      <div class='leave-head blue'><h1>รายการสมาชิก</h1><div>แก้ไข/ตรวจสถานะ</div></div>
+      <div class='leave-body blue'>{rows}</div>
+    </div>
+    <div class='admin-grid'>
+      <div class='card'><h3>เปิดรอบใหม่</h3><form action='/admin/open' method='post'><input type='hidden' name='token' value='{token}'><input name='title' placeholder='กรกฎาคม 2569'><button class='btn'>เปิดรอบ</button></form></div>
+      <div class='card'><h3>เพิ่ม/แก้สมาชิก</h3><form action='/admin/member' method='post'><input type='hidden' name='token' value='{token}'><input name='name' placeholder='ชื่อ'><input name='amount' placeholder='ยอด'><button class='btn'>บันทึก</button></form></div>
+    </div>
+    """
     return page("Admin", body)
+
+@app.get("/admin/approve/{payment_id}")
+def admin_approve(payment_id: int, token: str = "", db: Session = Depends(get_db)):
+    if token != settings.ADMIN_TOKEN:
+        raise HTTPException(403)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    services.mark_member_paid(db, p.member_id, Decimal(p.due_amount or 0), note=(p.note or "") + "\nadmin_approved", slip_path=p.slip_path)
+    update_line_summary(db)
+    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    if target:
+        push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท")])
+    return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
+
+@app.get("/admin/reject/{payment_id}")
+def admin_reject(payment_id: int, token: str = "", db: Session = Depends(get_db)):
+    if token != settings.ADMIN_TOKEN:
+        raise HTTPException(403)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    p.status = "unpaid"
+    p.paid_amount = Decimal("0")
+    p.paid_at = None
+    p.note = (p.note or "") + "\nadmin_rejected"
+    db.commit()
+    update_line_summary(db)
+    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    if target:
+        push(target, [text(f"❌ ไม่ผ่าน: {p.member.name} กรุณาอัปโหลดสลิปใหม่")])
+    return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
 
 @app.post("/admin/open")
 def admin_open(token: str = Form(...), title: str = Form(...), db: Session = Depends(get_db)):

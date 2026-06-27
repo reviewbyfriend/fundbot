@@ -11,6 +11,9 @@ class Settings:
     ADMIN_TOKEN: str = os.getenv("ADMIN_TOKEN", "admin123")
     SLIP_STORAGE_DIR: str = os.getenv("SLIP_STORAGE_DIR", "/data/slips")
     OCR_SPACE_API_KEY: str = os.getenv("OCR_SPACE_API_KEY", "")
+    # Optional: LINE user/group/room id ที่จะให้บอทแจ้งเตือนสลิปรอตรวจ
+    # ถ้าไม่ใส่ ระบบจะส่งแจ้งเตือนไปที่กลุ่ม/ห้อง LINE ล่าสุดที่คุยกับบอท
+    ADMIN_NOTIFY_TARGET_ID: str = os.getenv("ADMIN_NOTIFY_TARGET_ID", "")
     BOT_NAME: str = os.getenv("BOT_NAME", "FundBot")
 
 settings = Settings()

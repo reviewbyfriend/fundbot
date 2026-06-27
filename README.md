@@ -1,24 +1,48 @@
-# FundBot UI v1
+# FundBot v4 Manual Approval
 
-อัปเดต UI หน้ารายการสมาชิกและหน้าชำระเงิน
+เวอร์ชันนี้ไม่ใช้ OCR อนุมัติอัตโนมัติแล้ว
 
-## สิ่งที่เพิ่ม
-- Dashboard สวยขึ้นแบบการ์ด/สถานะสี
-- หน้าเลือกชื่อมี radio วงกลมหน้าแต่ละชื่อ
-- หน้าโอนเงินมี QR / Copy พร้อมเพย์ / Upload slip แบบเห็นชัด
-- Preview รูปสลิปก่อนอัปโหลด
-- สลิปเก็บแยกตามโฟลเดอร์เดือนใน `SLIP_STORAGE_DIR`
+Flow ใหม่:
+1. สมาชิกเลือกชื่อและโอนเงิน
+2. สมาชิกอัปโหลดสลิป
+3. ระบบเปลี่ยนสถานะเป็น `รอตรวจสอบ`
+4. ระบบแจ้งแอดมินใน LINE พร้อมปุ่ม `อนุมัติ` / `ไม่ผ่าน`
+5. แอดมินกดอนุมัติแล้ว Dashboard + LINE Group อัปเดตสถานะเป็น `ชำระแล้ว`
 
-## Railway Variables ที่ต้องมี
-- DATABASE_URL
-- LINE_CHANNEL_SECRET
-- LINE_CHANNEL_ACCESS_TOKEN
-- PROMPTPAY_ID
-- PUBLIC_BASE_URL (แนะนำใส่ URL Railway เช่น https://web-production-1b96.up.railway.app)
-- ADMIN_TOKEN (ถ้าใช้หลังบ้าน)
+## Railway Variables
+ต้องมี:
 
-## ใช้ใน LINE
-พิมพ์ในกลุ่ม:
-- `ส่งหน้าเก็บเงิน`
-- `ชำระเงิน`
-- `สรุป`
+```
+DATABASE_URL=
+LINE_CHANNEL_SECRET=
+LINE_CHANNEL_ACCESS_TOKEN=
+PROMPTPAY_ID=
+ADMIN_TOKEN=ตั้งรหัสหลังบ้าน เช่น friend123
+PUBLIC_BASE_URL=https://web-production-xxxx.up.railway.app
+```
+
+ไม่จำเป็นต้องใช้แล้ว:
+
+```
+OCR_SPACE_API_KEY
+```
+
+ใส่ก็ได้ แต่ระบบ v4 จะไม่เอา OCR มาอนุมัติอัตโนมัติ
+
+## ตัวเลือกเพิ่มเติม
+ถ้าอยากให้แจ้งเตือนไป LINE ส่วนตัว/กลุ่มแอดมินโดยเฉพาะ ให้ใส่:
+
+```
+ADMIN_NOTIFY_TARGET_ID=
+```
+
+ถ้าไม่ใส่ ระบบจะส่งแจ้งเตือนไปที่กลุ่ม/ห้อง LINE ล่าสุดที่คุยกับบอท
+
+## หน้าเว็บ
+- Dashboard: `/dashboard`
+- ชำระเงิน: `/pay`
+- หลังบ้าน: `/admin?token=ADMIN_TOKEN`
+
+## หมายเหตุเรื่องเก็บสลิป
+ค่าเริ่มต้นเก็บที่ `/data/slips` และเปิดดูผ่าน `/slips/...`
+ถ้าใช้ Railway ระยะยาว ควรผูก Volume กับ path `/data` เพื่อให้รูปสลิปไม่หายหลัง redeploy
