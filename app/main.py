@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -21,6 +22,7 @@ from .report import make_excel
 from .models import Expense, Payment
 
 app = FastAPI(title="FundBot MVP Clean")
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 @app.on_event("startup")
 def startup():
@@ -65,6 +67,19 @@ def parse_amount(s: str):
 
 def money(x):
     return services.money(x)
+
+def amount_key(x):
+    try:
+        return str(int(Decimal(x or 0)))
+    except Exception:
+        return ""
+
+def bank_qr_url(amount):
+    key = amount_key(amount)
+    static_file = Path(__file__).parent / "static" / "payment_qr" / f"{key}.jpg"
+    if static_file.exists():
+        return f"/static/payment_qr/{key}.jpg"
+    return None
 
 def collection_flex(db: Session):
     r = services.active_round(db)
@@ -162,8 +177,8 @@ def qr(member_id: int, db: Session = Depends(get_db)):
 
 CSS = """
 <style>
-:root{--navy:#071b46;--blue:#2f67ff;--green:#16a34a;--red:#ef4444;--amber:#f59e0b;--bg:#f3f6fb;--muted:#667085;--line:#e6eaf2;--card:#fff}
-*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Tahoma,sans-serif;background:linear-gradient(180deg,#eef5ff 0%,#f7f8fb 45%,#f5f7fb 100%);margin:0;color:#101828}.wrap{max-width:980px;margin:0 auto;padding:18px}.hero{background:linear-gradient(135deg,#071b46,#163e88 55%,#2f67ff);color:white;border-radius:28px;padding:22px;box-shadow:0 18px 50px rgba(7,27,70,.22);margin-bottom:14px}.title{font-size:28px;font-weight:900;color:#0b1f48;letter-spacing:-.3px}.hero .title{color:white}.sub{color:#667085}.hero .sub{color:#d9e6ff}.card{background:rgba(255,255,255,.92);backdrop-filter:blur(10px);border:1px solid #e6eaf2;border-radius:26px;box-shadow:0 14px 40px rgba(16,24,40,.08);padding:18px;margin:12px 0}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{border-radius:20px;padding:16px;background:#fff;border:1px solid #e6eaf2;box-shadow:0 10px 25px rgba(16,24,40,.04)}.num{font-size:24px;font-weight:900;letter-spacing:-.3px}.green{color:#159947}.red{color:#d93025}.muted{color:var(--muted)}.member-row{display:grid;grid-template-columns:42px 1fr 110px 146px;gap:10px;align-items:center;padding:13px 8px;border-bottom:1px solid #eef2f6}.avatar{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#dce9ff,#f4f7ff);font-weight:900;color:#24437a}.pill{border-radius:999px;padding:9px 12px;text-align:center;font-weight:800;font-size:13px}.paid{background:#e9f8ef;color:#148f4b;border:1px solid #c5efd4}.unpaid{background:#fdecec;color:#d93025;border:1px solid #ffd0d0}.partial{background:#fff7e6;color:#b76b00;border:1px solid #ffe2a8}.btn{display:block;text-align:center;text-decoration:none;border:0;border-radius:18px;padding:15px 18px;margin:10px 0;background:linear-gradient(135deg,#16a34a,#0e8d40);color:white;font-weight:900;font-size:17px;box-shadow:0 10px 25px rgba(22,163,74,.24)}.btn:active{transform:scale(.99)}.btn2{display:block;text-align:center;text-decoration:none;border:1px solid #bdd7ff;border-radius:16px;padding:13px;margin:9px 0;background:#eef6ff;color:#0b53ce;font-weight:800}.btn-light{background:#fff;color:#0b53ce;border:1px solid #bdd7ff}.choice{display:grid;grid-template-columns:26px 1fr 110px;align-items:center;gap:12px;text-decoration:none;color:#101828;padding:15px 12px;border-bottom:1px solid #eef2f6;border-radius:14px;margin:4px 0}.choice:hover,.choice.active{background:#eaf3ff}.radio{width:22px;height:22px;border-radius:50%;border:2px solid #c4cedd;display:flex;align-items:center;justify-content:center;background:#fff}.choice.active .radio{border-color:#111827}.choice.active .radio:after{content:'';width:10px;height:10px;background:#111827;border-radius:50%}.qrbox{display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid #e6eaf2;border-radius:22px;padding:18px;min-height:280px}.qr{max-width:240px;width:100%;display:block;margin:auto}.copybox{background:#f8fafc;border:1px solid #e6eaf2;border-radius:16px;padding:12px;margin:10px 0}.upload{border:2px dashed #b9c8dc;border-radius:20px;padding:24px;text-align:center;background:#f8fbff}.preview{max-width:100%;border-radius:16px;margin-top:12px;display:none}.success{font-size:72px;line-height:1}.top-actions{display:flex;gap:10px;flex-wrap:wrap}.top-actions a{flex:1}.note{font-size:13px;color:#667085;line-height:1.6}.bankhint{display:grid;grid-template-columns:1fr 1fr;gap:10px}.bankhint div{border-radius:16px;padding:12px;border:1px solid #e6eaf2;background:#fff}.admin-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}input{width:100%;border:1px solid #d8e1ef;border-radius:14px;padding:12px;margin:6px 0;background:#fff;font:inherit}button{font:inherit;cursor:pointer}@media(max-width:720px){.wrap{padding:12px}.hero{border-radius:24px;padding:18px}.title{font-size:25px}.stats{grid-template-columns:1fr}.member-row{grid-template-columns:36px 1fr 96px;gap:8px}.member-row .status{grid-column:2/4}.card{border-radius:22px;padding:14px}.choice{grid-template-columns:26px 1fr 95px}.admin-grid{grid-template-columns:1fr}.bankhint{grid-template-columns:1fr}}
+:root{--navy:#071b46;--blue:#2f67ff;--green:#16a34a;--red:#ef4444;--orange:#ff7a1a;--purple:#7c3aed;--pink:#ec4899;--bg:#eef4ff;--muted:#667085;--line:#e6eaf2;--card:#fff}
+*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Tahoma,sans-serif;background:linear-gradient(180deg,#eaf3ff 0%,#f6f8fc 45%,#f7f9fd 100%);margin:0;color:#101828}.wrap{max-width:980px;margin:0 auto;padding:18px}.hero{background:linear-gradient(135deg,#071b46,#17479c 58%,#2f67ff);color:white;border-radius:30px;padding:22px;box-shadow:0 18px 50px rgba(7,27,70,.22);margin-bottom:14px;position:relative;overflow:hidden}.hero:after{content:'';position:absolute;right:-35px;top:-35px;width:140px;height:140px;border-radius:50%;background:rgba(255,255,255,.12)}.title{font-size:28px;font-weight:900;color:#0b1f48;letter-spacing:-.3px}.hero .title{color:white}.sub{color:#667085}.hero .sub{color:#d9e6ff}.card{background:rgba(255,255,255,.94);backdrop-filter:blur(10px);border:1px solid #e6eaf2;border-radius:26px;box-shadow:0 14px 40px rgba(16,24,40,.08);padding:18px;margin:12px 0}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{border-radius:22px;padding:16px;background:#fff;border:1px solid #e6eaf2;box-shadow:0 10px 25px rgba(16,24,40,.04)}.num{font-size:24px;font-weight:900;letter-spacing:-.3px}.green{color:#159947}.red{color:#d93025}.muted{color:var(--muted)}.member-row{display:grid;grid-template-columns:44px 1fr 112px 152px;gap:10px;align-items:center;padding:13px 8px;border-bottom:1px solid #eef2f6}.member-row:last-child{border-bottom:0}.avatar{width:38px;height:38px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#dce9ff,#f4f7ff);font-weight:900;color:#24437a}.pill{border-radius:999px;padding:9px 12px;text-align:center;font-weight:800;font-size:13px}.paid{background:#e9f8ef;color:#148f4b;border:1px solid #c5efd4}.unpaid{background:#fdecec;color:#d93025;border:1px solid #ffd0d0}.partial{background:#fff7e6;color:#b76b00;border:1px solid #ffe2a8}.btn{display:block;text-align:center;text-decoration:none;border:0;border-radius:18px;padding:15px 18px;margin:10px 0;background:linear-gradient(135deg,#16a34a,#0e8d40);color:white;font-weight:900;font-size:17px;box-shadow:0 10px 25px rgba(22,163,74,.24)}.btn:active{transform:scale(.99)}.btn2{display:block;text-align:center;text-decoration:none;border:1px solid #bdd7ff;border-radius:16px;padding:13px;margin:9px 0;background:#eef6ff;color:#0b53ce;font-weight:800}.btn-light{background:#fff;color:#0b53ce;border:1px solid #bdd7ff}.leave-card{border-radius:28px;overflow:hidden;background:#fff;box-shadow:0 14px 42px rgba(16,24,40,.1);border:1px solid #e6eaf2}.leave-head{padding:20px 18px;background:linear-gradient(135deg,#ff7a1a,#ff9f43);color:#fff}.leave-head.blue{background:linear-gradient(135deg,#1f6feb,#2f67ff)}.leave-head h1{font-size:26px;margin:0 0 4px}.leave-body{padding:16px;background:#fff7ec}.leave-body.blue{background:#eef5ff}.list-title{font-size:22px;font-weight:900;color:#101828;margin-bottom:12px}.choice{display:grid;grid-template-columns:28px 1fr 118px;align-items:center;gap:12px;text-decoration:none;color:#101828;padding:16px 12px;border:1px solid transparent;border-radius:18px;margin:8px 0;background:white;box-shadow:0 5px 14px rgba(16,24,40,.04)}.choice:active,.choice.active{background:#eaf3ff;border-color:#93c5fd;box-shadow:0 8px 22px rgba(47,103,255,.16)}.radio{width:23px;height:23px;border-radius:50%;border:2px solid #c4cedd;display:flex;align-items:center;justify-content:center;background:#fff}.choice.active .radio,.choice:active .radio{border-color:#111827}.choice.active .radio:after,.choice:active .radio:after{content:'';width:10px;height:10px;background:#111827;border-radius:50%}.qrbox{display:flex;align-items:center;justify-content:center;background:#fff;border:1px solid #e6eaf2;border-radius:22px;padding:12px;min-height:300px;overflow:hidden}.qr{max-width:310px;width:100%;display:block;margin:auto;border-radius:12px}.qr.scb{max-width:360px;border-radius:10px}.copybox{background:#f8fafc;border:1px solid #e6eaf2;border-radius:16px;padding:12px;margin:10px 0}.upload{border:2px dashed #b9c8dc;border-radius:22px;padding:22px;text-align:center;background:#f8fbff;display:block;min-height:170px;cursor:pointer}.upload:hover{background:#eef6ff}.preview{max-width:100%;border-radius:16px;margin-top:12px;display:none}.success{font-size:72px;line-height:1}.top-actions{display:flex;gap:10px;flex-wrap:wrap}.top-actions a{flex:1}.note{font-size:13px;color:#667085;line-height:1.6}.bankhint{display:grid;grid-template-columns:1fr 1fr;gap:10px}.bankhint button,.bankhint a,.bankhint div{border-radius:18px;padding:13px;border:1px solid #e6eaf2;background:#fff;text-decoration:none;color:#101828;text-align:left}.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#101828;color:#fff;border-radius:999px;padding:12px 18px;font-weight:800;box-shadow:0 15px 45px rgba(0,0,0,.25);opacity:0;pointer-events:none;transition:.25s;z-index:9999}.toast.show{opacity:1}.admin-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}input{width:100%;border:1px solid #d8e1ef;border-radius:14px;padding:12px;margin:6px 0;background:#fff;font:inherit}button{font:inherit;cursor:pointer}@media(max-width:720px){.wrap{padding:12px}.hero{border-radius:24px;padding:18px}.title{font-size:25px}.stats{grid-template-columns:1fr}.member-row{grid-template-columns:38px 1fr 96px;gap:8px}.member-row .status{grid-column:2/4}.card{border-radius:22px;padding:14px}.choice{grid-template-columns:28px 1fr 100px}.admin-grid{grid-template-columns:1fr}.bankhint{grid-template-columns:1fr}.qr.scb{max-width:100%}}
 </style>
 """
 def page(title: str, body: str):
@@ -194,17 +209,20 @@ def dashboard():
       <div class='stat'>ชำระแล้ว<div class='num green' id='paid'>-</div><div class='muted' id='paidCount'>-</div></div>
       <div class='stat'>ค้างชำระ<div class='num red' id='unpaid'>-</div><div class='muted' id='unpaidCount'>-</div></div>
     </div>
-    <div class='card'>
-      <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px'><b style='font-size:19px'>รายการสมาชิก</b><span class='muted'>อัปเดตทุก 3 วิ</span></div>
-      <div id='rows'></div>
-      <a class='btn' href='/pay'>💳 ชำระเงิน</a>
+    <div class='leave-card'>
+      <div class='leave-head blue'><h1>รายการสมาชิก</h1><div id='round2'>เงินกองสำนักงาน</div></div>
+      <div class='leave-body blue'>
+        <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px'><b>สถานะการชำระ</b><span class='muted'>อัปเดตทุก 3 วิ</span></div>
+        <div id='rows'></div>
+        <a class='btn' href='/pay'>💳 ชำระเงิน</a>
+      </div>
     </div>
     <script>
     function baht(n){return Number(n||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})}
     function initials(name){return (name||'?').replace('ท่าน','').trim().slice(0,1)||'?'}
     async function load(){
       let r=await fetch('/api/status').then(x=>x.json());
-      round.textContent='เดือน '+r.round;
+      round.textContent='เดือน '+r.round; round2.textContent='เงินกองสำนักงาน • '+r.round;
       due.textContent=baht(r.due); paid.textContent=baht(r.paid); unpaid.textContent=baht(r.unpaid);
       paidCount.textContent=(r.paid_count||0)+' คน'; unpaidCount.textContent=(r.unpaid_count||0)+' คน';
       rows.innerHTML=r.members.map(m=>`<div class='member-row'><div class='avatar'>${initials(m.name)}</div><b>${m.name}</b><b style='text-align:right'>${baht(m.amount)}</b><span class='status pill ${m.status=='paid'?'paid':(m.status=='partial'?'partial':'unpaid')}'>${m.status=='paid'?'✅ ชำระแล้ว':(m.status=='partial'?'🟡 ชำระบางส่วน':'⏰ ยังไม่ได้ชำระ')}</span></div>`).join('')
@@ -221,14 +239,19 @@ def pay(db: Session = Depends(get_db)):
     items = "".join([f"""
       <a class='choice' href='/pay/{p.member.id}'>
         <span class='radio'></span>
-        <b>{p.member.name}<br><small class='muted'>{'ชำระแล้ว' if p.status=='paid' else 'เลือกชื่อนี้เพื่อชำระ'}</small></b>
+        <b>{p.member.name}<br><small class='muted'>{'ชำระแล้ว' if p.status=='paid' else 'แตะเพื่อเลือกชื่อนี้'}</small></b>
         <b style='text-align:right'>{money(p.due_amount)} บาท</b>
       </a>
     """ for p in pays])
     return page("ชำระเงิน", f"""
-      <div class='hero'><div class='title'>ชำระเงิน</div><div class='sub'>เลือกชื่อที่ต้องการชำระ • {r.title if r else '-'}</div></div>
-      <div class='card'>{items}</div>
-      <a class='btn2' href='/dashboard'>กลับ Dashboard</a>
+      <div class='leave-card'>
+        <div class='leave-head'><h1>ชำระเงิน</h1><div>เลือกชื่อที่ต้องการชำระ • {r.title if r else '-'}</div></div>
+        <div class='leave-body'>
+          <div class='list-title'>เลือกผู้ชำระเงิน</div>
+          {items}
+          <a class='btn2' href='/dashboard'>กลับ Dashboard</a>
+        </div>
+      </div>
       <script>
         document.querySelectorAll('.choice').forEach(el=>el.addEventListener('click',()=>{{document.querySelectorAll('.choice').forEach(x=>x.classList.remove('active'));el.classList.add('active')}}))
       </script>
@@ -239,8 +262,17 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
     r = services.active_round(db); m = services.member_by_id(db, member_id)
     if not r or not m: raise HTTPException(404)
     p = services.ensure_payment(db, r, m)
-    pp = settings.PROMPTPAY_ID or 'ยังไม่ได้ตั้ง PROMPTPAY_ID'
-    qr_html = f"<img class='qr' src='/qr/{m.id}'>" if settings.PROMPTPAY_ID else "<div class='muted' style='text-align:center'>เพิ่ม PROMPTPAY_ID ใน Railway ก่อน QR จึงจะขึ้น</div>"
+    pp = settings.PROMPTPAY_ID or '0858131344'
+    static_qr = bank_qr_url(p.due_amount)
+    if static_qr:
+        qr_html = f"<img class='qr scb' src='{static_qr}' alt='QR พร้อมเพย์ {money(p.due_amount)} บาท'>"
+        qr_note = "QR นี้เป็นรูปจากธนาคารและกำหนดยอดตามชื่อที่เลือกแล้ว"
+    elif settings.PROMPTPAY_ID:
+        qr_html = f"<img class='qr' src='/qr/{m.id}' alt='QR พร้อมเพย์'>"
+        qr_note = "QR นี้สร้างจาก PROMPTPAY_ID ในระบบ"
+    else:
+        qr_html = "<div class='muted' style='text-align:center'>ยังไม่ได้ตั้ง PROMPTPAY_ID และยังไม่มีรูป QR ยอดนี้</div>"
+        qr_note = "เพิ่ม PROMPTPAY_ID หรือรูป QR ตามยอดก่อนใช้งาน"
     body = f"""
     <div class='hero'><div class='title'>ชำระเงิน</div><div class='sub'>{r.title}</div></div>
     <div class='card'>
@@ -249,22 +281,21 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
       <div class='num green' style='font-size:34px'>{money(p.due_amount)} บาท</div>
       <div class='copybox'>พร้อมเพย์<br><b id='pp'>{pp}</b></div>
       <div class='bankhint'>
-        <div>📋 <b>Copy พร้อมเพย์</b><br><span class='note'>คัดลอกเลขแล้วเปิดแอปธนาคารเอง</span></div>
-        <div>📱 <b>เปิดแอปธนาคาร</b><br><span class='note'>ปุ่มนี้เปิดได้เฉพาะบางเครื่อง/บางธนาคาร</span></div>
+        <button type='button' onclick='copyPP()'>📋 <b>Copy พร้อมเพย์</b><br><span class='note'>คัดลอกเลขพร้อมเพย์</span></button>
+        <button type='button' onclick='openBank()'>📱 <b>เปิดแอปธนาคาร</b><br><span class='note'>ลองเปิด Krungthai NEXT / แอปธนาคาร</span></button>
       </div>
-      <button class='btn2' onclick='copyPP()'>Copy พร้อมเพย์</button>
-      <a class='btn2' href='intent://scan/#Intent;scheme=promptpay;end'>ลองเปิดแอปธนาคาร</a>
+      <div id='toast' class='toast'>คัดลอกพร้อมเพย์แล้ว</div>
     </div>
     <div class='card'>
       <h3 style='margin-top:0'>QR พร้อมเพย์</h3>
       <div class='qrbox'>{qr_html}</div>
-      <p class='note'>แนะนำ: เปิดแอปธนาคาร แล้วสแกน QR หรือใช้ Copy พร้อมเพย์</p>
+      <p class='note'>{qr_note}</p>
     </div>
     <div class='card'>
       <h3 style='margin-top:0'>อัปโหลดสลิป</h3>
       <form action='/upload/{m.id}' method='post' enctype='multipart/form-data'>
         <label class='upload'>
-          <div style='font-size:34px'>📎</div>
+          <div style='font-size:44px'>📎</div>
           <b>แตะเพื่อเลือกรูปสลิป</b><br><span class='note'>รองรับ JPG, PNG</span>
           <input id='slipInput' style='display:none' type='file' name='slip' accept='image/*' required onchange='previewSlip(event)'>
           <img id='preview' class='preview'>
@@ -274,7 +305,15 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
     </div>
     <a class='btn2' href='/pay'>กลับ</a>
     <script>
-      function copyPP(){{navigator.clipboard.writeText(document.getElementById('pp').innerText);alert('คัดลอกพร้อมเพย์แล้ว')}}
+      function showToast(msg){{let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}}
+      function copyPP(){{navigator.clipboard.writeText(document.getElementById('pp').innerText).then(()=>showToast('คัดลอกพร้อมเพย์แล้ว'))}}
+      function openBank(){{
+        showToast('กำลังลองเปิดแอปธนาคาร...');
+        let schemes=['krungthai-next://','krungthai://','scbeasy://','kplus://'];
+        let i=0;
+        function go(){{ if(i<schemes.length){{ location.href=schemes[i++]; setTimeout(go,700); }} }}
+        go();
+      }}
       function previewSlip(e){{let f=e.target.files[0]; if(!f)return; let img=document.getElementById('preview'); img.src=URL.createObjectURL(f); img.style.display='block'}}
     </script>
     """
