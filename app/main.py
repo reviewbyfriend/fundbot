@@ -7,6 +7,9 @@ import shutil
 import tempfile
 import uuid
 import asyncio
+import json
+import time
+import secrets
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -23,7 +26,7 @@ from .line_client import flex, reply, push, text
 from .promptpay import qr_png_base64
 from .report import make_excel, make_word, make_pdf
 from PIL import Image, ImageOps
-from .models import Expense, Payment, BotState
+from .models import Expense, Payment, BotState, AdminUser, AdminAuditLog
 
 app = FastAPI(title="FundBot v2 Stable")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
@@ -42,6 +45,7 @@ def startup():
         if not services.active_round(db):
             now = datetime.now()
             services.open_round(db, f"{now.strftime('%Y-%m')}")
+        ensure_owner_admin(db)
     finally:
         db.close()
 
@@ -107,6 +111,88 @@ def get_state(db: Session, key: str) -> str | None:
 def admin_notify_target(db: Session) -> str | None:
     # ส่งรายการรออนุมัติไปหาแอดมินส่วนตัวก่อน ถ้าไม่ได้ตั้งไว้จึง fallback ไปกลุ่มล่าสุด
     return settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "admin_notify_target_id") or get_state(db, "line_target_id")
+
+
+def admin_code_hash(code: str) -> str:
+    raw = (settings.ADMIN_TOKEN + "|" + (code or "").strip()).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_admin_code(code: str, hashed: str) -> bool:
+    return hmac.compare_digest(admin_code_hash(code), hashed or "")
+
+
+def session_sign(payload: str) -> str:
+    return hmac.new(settings.ADMIN_TOKEN.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_admin_session(admin: AdminUser) -> str:
+    exp = int(time.time()) + 60 * 60 * 24 * 30
+    payload = json.dumps({"id": admin.id, "name": admin.name, "role": admin.role, "exp": exp}, ensure_ascii=False, separators=(",", ":"))
+    b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    return b64 + "." + session_sign(b64)
+
+
+def read_admin_session(request: Request, db: Session):
+    raw = request.cookies.get("fundbot_admin") if request else None
+    if not raw or "." not in raw:
+        return None
+    b64, sig = raw.rsplit(".", 1)
+    if not hmac.compare_digest(session_sign(b64), sig):
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    admin = db.query(AdminUser).filter(AdminUser.id == int(payload.get("id", 0)), AdminUser.active == True).first()
+    if not admin:
+        return None
+    return {"id": admin.id, "name": admin.name, "role": admin.role, "legacy": False}
+
+
+def legacy_admin(token: str):
+    if token and token == settings.ADMIN_TOKEN:
+        return {"id": None, "name": "Owner Token", "role": "owner", "legacy": True}
+    return None
+
+
+def current_admin(request: Request, db: Session, token: str = ""):
+    return legacy_admin(token) or read_admin_session(request, db)
+
+
+def require_admin(request: Request, db: Session, token: str = "", roles=("owner", "approver", "viewer")):
+    admin = current_admin(request, db, token)
+    if not admin or admin.get("role") not in roles:
+        raise HTTPException(403)
+    return admin
+
+
+def require_approver(request: Request, db: Session, token: str = ""):
+    return require_admin(request, db, token, roles=("owner", "approver"))
+
+
+def require_owner(request: Request, db: Session, token: str = ""):
+    return require_admin(request, db, token, roles=("owner",))
+
+
+def audit_admin(db: Session, admin: dict, action: str, payment_id: int | None = None, detail: str | None = None):
+    db.add(AdminAuditLog(admin_id=admin.get("id"), admin_name=admin.get("name") or "Admin", action=action, payment_id=payment_id, detail=detail))
+    db.commit()
+
+
+def ensure_owner_admin(db: Session):
+    # สร้าง owner เริ่มต้นจาก ADMIN_TOKEN เฉพาะกรณียังไม่มีแอดมินเลย
+    if db.query(AdminUser).count() == 0:
+        code = settings.ADMIN_TOKEN or "admin123"
+        owner = AdminUser(name="เฟรน", role="owner", code_hash=admin_code_hash(code), active=True)
+        db.add(owner)
+        db.commit()
+
+
+def admin_return_url(token: str = "") -> str:
+    return f"/admin?token={token}#pending" if token else "/admin#pending"
 
 
 def save_line_target(db: Session, event: dict):
@@ -802,10 +888,10 @@ def report_pdf(db: Session = Depends(get_db)):
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
     return Response(make_pdf(r, payments), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=fundbot_report.pdf"})
 
+
 @app.get("/admin/evidence/{payment_id}")
-def admin_evidence(payment_id: int, token: str = "", db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN:
-        raise HTTPException(403)
+def admin_evidence(payment_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
+    require_admin(request, db, token)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
@@ -820,35 +906,64 @@ def admin_evidence(payment_id: int, token: str = "", db: Session = Depends(get_d
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login():
     return page("Admin Login", """
-    <div class='hero'><div class='title'>🔐 หลังบ้าน FundBot</div><div class='sub'>สำหรับแอดมินอนุมัติสลิป/เงินสด</div></div>
+    <div class='hero'><div class='title'>🔐 หลังบ้าน FundBot</div><div class='sub'>แอดมินหลายคนเข้าได้ด้วย Admin Code ของตัวเอง</div></div>
     <div class='card'>
       <h2 style='margin-top:0'>เข้าสู่ระบบแอดมิน</h2>
-      <p class='note'>ใส่ ADMIN_TOKEN ที่ตั้งไว้ใน Railway Variables</p>
-      <input id='tok' type='password' placeholder='ADMIN_TOKEN' autocomplete='current-password'>
-      <button class='btn' type='button' onclick='goAdmin()'>เข้าอนุมัติรายการ</button>
+      <p class='note'>ใส่ Admin Code ส่วนตัวของแต่ละคน หรือใส่ ADMIN_TOKEN หลักครั้งแรกเพื่อเข้าแบบ Owner</p>
+      <form method='post' action='/admin/login'>
+        <input name='code' type='password' placeholder='Admin Code' autocomplete='current-password' required>
+        <button class='btn' type='submit'>เข้าอนุมัติรายการ</button>
+      </form>
       <a class='btn2' href='/dashboard'>กลับ Dashboard</a>
     </div>
-    <script>
-      function goAdmin(){
-        const t=document.getElementById('tok').value.trim();
-        if(!t){return}
-        location.href='/admin?token='+encodeURIComponent(t)+'#pending';
-      }
-      document.getElementById('tok').addEventListener('keydown',e=>{if(e.key==='Enter')goAdmin()});
-    </script>
     """)
 
+
+@app.post("/admin/login")
+def admin_login_post(code: str = Form(...), db: Session = Depends(get_db)):
+    ensure_owner_admin(db)
+    code = (code or "").strip()
+    admin = None
+    # legacy token ยังคงเข้าได้เสมอ และถือเป็น Owner
+    if code == settings.ADMIN_TOKEN:
+        admin = db.query(AdminUser).filter(AdminUser.role == "owner", AdminUser.active == True).order_by(AdminUser.id).first()
+        if not admin:
+            admin = AdminUser(name="เฟรน", role="owner", code_hash=admin_code_hash(code), active=True)
+            db.add(admin); db.commit(); db.refresh(admin)
+    else:
+        for a in db.query(AdminUser).filter(AdminUser.active == True).all():
+            if verify_admin_code(code, a.code_hash):
+                admin = a
+                break
+    if not admin:
+        return page("Login ไม่สำเร็จ", "<div class='card'><h2>รหัสไม่ถูกต้อง</h2><p class='note'>กรุณาตรวจ Admin Code อีกครั้ง</p><a class='btn2' href='/admin/login'>กลับไปล็อกอิน</a></div>")
+    admin.last_login_at = datetime.utcnow()
+    db.commit()
+    resp = RedirectResponse("/admin#pending", status_code=303)
+    resp.set_cookie("fundbot_admin", make_admin_session(admin), httponly=True, samesite="lax", secure=True, max_age=60*60*24*30)
+    return resp
+
+
+@app.get("/admin/logout")
+def admin_logout():
+    resp = RedirectResponse("/admin/login", status_code=303)
+    resp.delete_cookie("fundbot_admin")
+    return resp
+
+
 @app.get("/admin", response_class=HTMLResponse)
-def admin(token: str = "", db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN:
-        raise HTTPException(403)
+def admin(request: Request, token: str = "", db: Session = Depends(get_db)):
+    admin_ctx = require_admin(request, db, token)
     r = services.active_round(db)
     pays = services.get_payments(db, r) if r else []
     pending = [p for p in pays if p.status == "pending"]
+    token_hidden = f"<input type='hidden' name='token' value='{token}'>" if token else ""
+    query = f"?token={token}" if token else ""
     rows = "".join([f"<div class='member-row'><div class='avatar'>{p.member.name.replace('ท่าน','').strip()[:1] or '?'}</div><b>{p.member.name}</b><b style='text-align:right'>{money(p.due_amount)}</b><span class='status pill {'paid' if p.status=='paid' else ('partial' if p.status=='pending' else 'unpaid')}'>{'✅ ชำระแล้ว' if p.status=='paid' else ('🟡 รอตรวจ' if p.status=='pending' else 'ยังไม่ชำระ')}</span></div>" for p in pays])
     pending_cards = ""
+    can_approve = admin_ctx["role"] in ["owner", "approver"]
     for p in pending:
-        slip_url = f"/admin/evidence/{p.id}?token={token}&v={int(datetime.now().timestamp())}" if evidence_file_exists(p) else ""
+        slip_url = f"/admin/evidence/{p.id}{query}&v={int(datetime.now().timestamp())}" if evidence_file_exists(p) else ""
         if slip_url:
             img = f"""<a href='{slip_url}' target='_blank' rel='noopener'>
               <img src='{slip_url}' alt='หลักฐานการชำระเงิน'
@@ -857,74 +972,151 @@ def admin(token: str = "", db: Session = Depends(get_db)):
             </a>"""
         else:
             img = "<div class='copybox'><b>ไม่พบไฟล์หลักฐาน</b><br><span class='note'>รายการนี้อาจถูกสร้างก่อน deploy รอบล่าสุด หรือยังไม่ได้ตั้ง Railway Volume ให้เก็บไฟล์ถาวร ให้ผู้ใช้ส่งหลักฐานใหม่อีกครั้ง</span></div>"
+        actions = f"""
+          <div class='top-actions'>
+            <a class='btn' href='/admin/approve/{p.id}{query}'>✅ อนุมัติ</a>
+            <form action='/admin/reject/{p.id}' method='post' style='flex:1'>
+              {token_hidden}
+              <input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'>
+              <button class='btn2' type='submit'>❌ Reject</button>
+            </form>
+          </div>
+        """ if can_approve else "<div class='copybox'><b>Viewer</b><br><span class='note'>บัญชีนี้ดูได้อย่างเดียว ยังอนุมัติไม่ได้</span></div>"
         pending_cards += f"""
         <div class='card' id='pending'>
           <h3 style='margin:0'>📥 {p.member.name}</h3>
           <div class='num green'>{money(p.due_amount)} บาท</div><p class='note'>ประเภท: {'เงินสด' if getattr(p, 'payment_type', '') == 'cash' else 'โอน'} • วันที่ส่ง: {p.paid_at.strftime('%d/%m/%Y %H:%M') if p.paid_at else '-'}</p>
           {img}
-          <div class='top-actions'>
-            <a class='btn' href='/admin/approve/{p.id}?token={token}'>✅ อนุมัติ</a>
-            <form action='/admin/reject/{p.id}' method='post' style='flex:1'>
-              <input type='hidden' name='token' value='{token}'>
-              <input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'>
-              <button class='btn2' type='submit'>❌ Reject</button>
-            </form>
-          </div>
+          {actions}
         </div>
         """
     if not pending_cards:
         pending_cards = "<div class='card' id='pending'><h3>📥 สลิปรอตรวจ</h3><p class='muted'>ยังไม่มีสลิปรอตรวจ</p></div>"
+    owner_tools = ""
+    if admin_ctx["role"] == "owner":
+        owner_tools = f"""
+        <div class='admin-grid'>
+          <div class='card'><h3>เปิดรอบใหม่</h3><form action='/admin/open' method='post'>{token_hidden}<input name='title' placeholder='กรกฎาคม 2569'><button class='btn'>เปิดรอบ</button></form></div>
+          <div class='card'><h3>เพิ่ม/แก้สมาชิก</h3><form action='/admin/member' method='post'>{token_hidden}<input name='name' placeholder='ชื่อ'><input name='amount' placeholder='ยอด'><button class='btn'>บันทึก</button></form></div>
+        </div>
+        """
+    logs = db.query(AdminAuditLog).order_by(AdminAuditLog.id.desc()).limit(12).all()
+    log_html = "".join([f"<div class='member-row'><div class='avatar'>📝</div><b>{l.admin_name}</b><span>{l.action}</span><span class='note'>{l.created_at.strftime('%d/%m %H:%M')}</span></div>" for l in logs]) or "<p class='muted'>ยังไม่มีประวัติ</p>"
     body = f"""
-    <div class='hero'><div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'}</div></div>
+    <div class='hero'><div class='title'>หลังบ้าน FundBot</div><div class='sub'>รอบ: {r.title if r else '-'} · เข้าระบบโดย {admin_ctx['name']} ({admin_ctx['role']})</div></div>
+    <div class='top-actions'><a class='btn2' href='/admin/admins{query}'>👥 จัดการแอดมิน</a><a class='btn2' href='/dashboard'>เปิด Dashboard</a><a class='btn2' href='/admin/logout'>ออกจากระบบ</a></div>
     <div class='stats'>
       <div class='stat'><b>สลิปรอตรวจ</b><div class='num' style='color:#b76b00'>{len(pending)}</div><div class='muted'>รายการ</div></div>
       <div class='stat'><b>รายงาน</b><a class='btn2' href='/report.xlsx'>Excel</a><a class='btn2' href='/report.docx'>Word</a><a class='btn2' href='/report.pdf'>PDF</a></div>
-      <div class='stat'><b>Dashboard</b><a class='btn2' href='/dashboard'>เปิดหน้า Dashboard</a></div>
+      <div class='stat'><b>สิทธิ์</b><div class='num'>{admin_ctx['role']}</div><div class='muted'>{admin_ctx['name']}</div></div>
     </div>
     {pending_cards}
     <div class='leave-card'>
       <div class='leave-head blue'><h1>รายการสมาชิก</h1><div>แก้ไข/ตรวจสถานะ</div></div>
       <div class='leave-body blue'>{rows}</div>
     </div>
-    <div class='admin-grid'>
-      <div class='card'><h3>เปิดรอบใหม่</h3><form action='/admin/open' method='post'><input type='hidden' name='token' value='{token}'><input name='title' placeholder='กรกฎาคม 2569'><button class='btn'>เปิดรอบ</button></form></div>
-      <div class='card'><h3>เพิ่ม/แก้สมาชิก</h3><form action='/admin/member' method='post'><input type='hidden' name='token' value='{token}'><input name='name' placeholder='ชื่อ'><input name='amount' placeholder='ยอด'><button class='btn'>บันทึก</button></form></div>
-    </div>
+    {owner_tools}
+    <div class='card'><h3>ประวัติแอดมินล่าสุด</h3>{log_html}</div>
     """
     return page("Admin", body)
 
+
+@app.get("/admin/admins", response_class=HTMLResponse)
+def admin_users(request: Request, token: str = "", db: Session = Depends(get_db)):
+    admin_ctx = require_admin(request, db, token)
+    query = f"?token={token}" if token else ""
+    token_hidden = f"<input type='hidden' name='token' value='{token}'>" if token else ""
+    admins = db.query(AdminUser).order_by(AdminUser.id).all()
+    rows = "".join([f"""
+    <div class='member-row'>
+      <div class='avatar'>{a.name[:1]}</div><b>{a.name}</b><span class='pill {'paid' if a.active else 'unpaid'}'>{a.role} · {'เปิดใช้' if a.active else 'ปิด'}</span>
+      <span class='note'>{a.last_login_at.strftime('%d/%m %H:%M') if a.last_login_at else '-'}</span>
+    </div>""" for a in admins])
+    add_form = ""
+    if admin_ctx["role"] == "owner":
+        add_form = f"""
+        <div class='card'>
+          <h3>เพิ่ม/เปลี่ยน Admin Code</h3>
+          <form method='post' action='/admin/admins'>
+            {token_hidden}
+            <input name='name' placeholder='ชื่อ เช่น จริยา' required>
+            <select name='role' style='width:100%;border:1px solid #d8e1ef;border-radius:14px;padding:12px;margin:6px 0;background:#fff;font:inherit'>
+              <option value='approver'>Approver: อนุมัติ/ปฏิเสธได้</option>
+              <option value='viewer'>Viewer: ดูได้อย่างเดียว</option>
+              <option value='owner'>Owner: จัดการแอดมินได้</option>
+            </select>
+            <input name='code' placeholder='ตั้ง Admin Code ส่วนตัว' required>
+            <button class='btn'>บันทึกแอดมิน</button>
+          </form>
+          <p class='note'>ส่ง Admin Code ให้เฉพาะคนที่ไว้ใจได้ แต่ละคนใช้คนละรหัส เวลาอนุมัติระบบจะบันทึกชื่อไว้</p>
+        </div>
+        """
+    else:
+        add_form = "<div class='copybox'>เฉพาะ Owner เท่านั้นที่เพิ่ม/แก้แอดมินได้</div>"
+    return page("Admins", f"""
+    <div class='hero'><div class='title'>👥 แอดมินหลายคน</div><div class='sub'>ไม่ผูก LINE ID · ใช้ Admin Code แยกคน</div></div>
+    <div class='top-actions'><a class='btn2' href='/admin{query}'>กลับหน้าอนุมัติ</a><a class='btn2' href='/admin/logout'>ออกจากระบบ</a></div>
+    {add_form}
+    <div class='card'><h3>รายชื่อแอดมิน</h3>{rows}</div>
+    """)
+
+
+@app.post("/admin/admins")
+def admin_users_post(request: Request, token: str = Form(""), name: str = Form(...), role: str = Form("approver"), code: str = Form(...), db: Session = Depends(get_db)):
+    admin_ctx = require_owner(request, db, token)
+    role = role if role in ["owner", "approver", "viewer"] else "approver"
+    name = " ".join(name.strip().split())
+    code = code.strip()
+    if len(code) < 4:
+        raise HTTPException(400, detail="Admin Code ต้องมีอย่างน้อย 4 ตัว")
+    a = db.query(AdminUser).filter(AdminUser.name == name).first()
+    if not a:
+        a = AdminUser(name=name, role=role, code_hash=admin_code_hash(code), active=True)
+        db.add(a)
+        action = "create_admin"
+    else:
+        a.role = role
+        a.code_hash = admin_code_hash(code)
+        a.active = True
+        action = "update_admin"
+    db.commit()
+    audit_admin(db, admin_ctx, action, detail=f"{name}:{role}")
+    return RedirectResponse(f"/admin/admins{'?token='+token if token else ''}", status_code=303)
+
+
 @app.get("/admin/approve/{payment_id}")
-def admin_approve(payment_id: int, token: str = "", db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN:
-        raise HTTPException(403)
+def admin_approve(payment_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
+    admin_ctx = require_approver(request, db, token)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
     ptype = getattr(p, "payment_type", "") or ("cash" if getattr(p, "receipt_path", None) else "transfer")
-    services.mark_member_paid(db, p.member_id, Decimal(p.due_amount or 0), note=(p.note or "") + "\nadmin_approved", slip_path=p.slip_path)
+    services.mark_member_paid(db, p.member_id, Decimal(p.due_amount or 0), note=(p.note or "") + f"\nadmin_approved_by:{admin_ctx['name']}", slip_path=p.slip_path)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     p.payment_type = ptype
     p.rejection_reason = None
     db.commit()
+    audit_admin(db, admin_ctx, "approve", p.id, f"{p.member.name} {money(p.due_amount)} {ptype}")
     update_line_summary(db)
     target = admin_notify_target(db)
     if target:
-        push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท")])
-    return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
+        push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท\nโดย: {admin_ctx['name']}")])
+    return RedirectResponse(admin_return_url(token), status_code=303)
+
 
 @app.get("/admin/reject/{payment_id}", response_class=HTMLResponse)
-def admin_reject_form(payment_id: int, token: str = "", db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN:
-        raise HTTPException(403)
+def admin_reject_form(payment_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
+    require_approver(request, db, token)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
-    return page("Reject", f"<div class='card'><h2>Reject: {p.member.name}</h2><form method='post' action='/admin/reject/{p.id}'><input type='hidden' name='token' value='{token}'><input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'><button class='btn'>บันทึก Reject</button></form></div>")
+    token_hidden = f"<input type='hidden' name='token' value='{token}'>" if token else ""
+    return page("Reject", f"<div class='card'><h2>Reject: {p.member.name}</h2><form method='post' action='/admin/reject/{p.id}'>{token_hidden}<input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'><button class='btn'>บันทึก Reject</button></form></div>")
+
 
 @app.post("/admin/reject/{payment_id}")
-def admin_reject(payment_id: int, token: str = Form(...), reason: str = Form(...), db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN:
-        raise HTTPException(403)
+def admin_reject(payment_id: int, request: Request, token: str = Form(""), reason: str = Form(...), db: Session = Depends(get_db)):
+    admin_ctx = require_approver(request, db, token)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
@@ -932,22 +1124,27 @@ def admin_reject(payment_id: int, token: str = Form(...), reason: str = Form(...
     p.paid_amount = Decimal("0")
     p.paid_at = None
     p.rejection_reason = reason.strip()
-    p.note = (p.note or "") + f"\nadmin_rejected:{reason.strip()}"
+    p.note = (p.note or "") + f"\nadmin_rejected_by:{admin_ctx['name']}:{reason.strip()}"
     db.commit()
+    audit_admin(db, admin_ctx, "reject", p.id, f"{p.member.name}: {reason.strip()}")
     update_line_summary(db)
     target = admin_notify_target(db)
     if target:
-        push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nกรุณาอัปโหลดใหม่")])
-    return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
+        push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nโดย: {admin_ctx['name']}\nกรุณาอัปโหลดใหม่")])
+    return RedirectResponse(admin_return_url(token), status_code=303)
+
 
 @app.post("/admin/open")
-def admin_open(token: str = Form(...), title: str = Form(...), db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN: raise HTTPException(403)
+def admin_open(request: Request, token: str = Form(""), title: str = Form(...), db: Session = Depends(get_db)):
+    admin_ctx = require_owner(request, db, token)
     services.open_round(db, title)
-    return RedirectResponse(f"/admin?token={token}", status_code=303)
+    audit_admin(db, admin_ctx, "open_round", detail=title)
+    return RedirectResponse(f"/admin{'?token='+token if token else ''}", status_code=303)
+
 
 @app.post("/admin/member")
-def admin_member(token: str = Form(...), name: str = Form(...), amount: str = Form(...), db: Session = Depends(get_db)):
-    if token != settings.ADMIN_TOKEN: raise HTTPException(403)
+def admin_member(request: Request, token: str = Form(""), name: str = Form(...), amount: str = Form(...), db: Session = Depends(get_db)):
+    admin_ctx = require_owner(request, db, token)
     services.add_member(db, name, parse_amount(amount) or Decimal("0"))
-    return RedirectResponse(f"/admin?token={token}", status_code=303)
+    audit_admin(db, admin_ctx, "upsert_member", detail=f"{name} {amount}")
+    return RedirectResponse(f"/admin{'?token='+token if token else ''}", status_code=303)

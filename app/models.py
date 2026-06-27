@@ -58,3 +58,25 @@ class BotState(Base):
     key = Column(String(120), primary_key=True)
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), unique=True, index=True, nullable=False)
+    role = Column(String(20), default="approver")  # owner / approver / viewer
+    code_hash = Column(String(128), nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime, nullable=True)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+    id = Column(Integer, primary_key=True)
+    admin_id = Column(Integer, ForeignKey("admin_users.id"), nullable=True)
+    admin_name = Column(String(120), nullable=False)
+    action = Column(String(40), nullable=False)
+    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=True)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

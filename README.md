@@ -82,3 +82,18 @@ SIGNATURE_STORAGE_DIR=/data/signatures
 - หน้า Admin จะแจ้งชัดเจนถ้าไฟล์หลักฐานหายหลัง redeploy/restart
 - เพิ่ม K PLUS fallback หลาย scheme และไม่ใช้ browser alert
 - แนะนำ Railway: ผูก Volume ที่ `/data` เพื่อให้สลิปและลายเซ็นไม่หายหลัง redeploy
+
+## Multi-Admin v2.1
+
+เพิ่มระบบแอดมินหลายคนแบบไม่ผูก LINE ID
+
+### วิธีใช้งานครั้งแรก
+1. เข้า `/admin/login`
+2. ใส่ `ADMIN_TOKEN` จาก Railway Variables เพื่อเข้าเป็น Owner ครั้งแรก
+3. ไปที่ `/admin/admins`
+4. เพิ่มแอดมินได้หลายคน โดยกำหนด Role:
+   - Owner: เพิ่ม/แก้แอดมิน เปิดรอบ แก้สมาชิก อนุมัติ/ปฏิเสธ
+   - Approver: อนุมัติ/ปฏิเสธ และดูหลักฐาน
+   - Viewer: ดูรายการได้อย่างเดียว
+
+ระบบจะบันทึกประวัติว่าใครเป็นคนอนุมัติหรือปฏิเสธใน Admin Audit Log
