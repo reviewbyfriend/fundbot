@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -47,7 +47,7 @@ def startup():
 
 @app.get("/")
 def home():
-    return {"ok": True, "name": settings.BOT_NAME, "dashboard": "/dashboard", "webhook": "/webhook"}
+    return {"ok": True, "name": settings.BOT_NAME, "dashboard": "/dashboard", "admin_login": "/admin/login", "webhook": "/webhook"}
 
 @app.get("/health")
 def health():
@@ -102,6 +102,11 @@ def set_state(db: Session, key: str, value: str | None):
 def get_state(db: Session, key: str) -> str | None:
     st = db.query(BotState).filter(BotState.key == key).first()
     return st.value if st else None
+
+
+def admin_notify_target(db: Session) -> str | None:
+    # ส่งรายการรออนุมัติไปหาแอดมินส่วนตัวก่อน ถ้าไม่ได้ตั้งไว้จึง fallback ไปกลุ่มล่าสุด
+    return settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "admin_notify_target_id") or get_state(db, "line_target_id")
 
 
 def save_line_target(db: Session, event: dict):
@@ -176,13 +181,32 @@ def evidence_url(payment: Payment) -> str:
     return slip_public_url(payment.slip_path)
 
 
+def evidence_file_path(payment: Payment) -> Path | None:
+    raw = getattr(payment, "receipt_path", None) if getattr(payment, "payment_type", "") == "cash" else getattr(payment, "slip_path", None)
+    if not raw:
+        return None
+    try:
+        resolved = Path(raw).resolve()
+        allowed = [Path(settings.SLIP_STORAGE_DIR).resolve(), Path(settings.SIGNATURE_STORAGE_DIR).resolve()]
+        if not any(str(resolved).startswith(str(root)) for root in allowed):
+            return None
+        return resolved
+    except Exception:
+        return None
+
+
+def evidence_file_exists(payment: Payment) -> bool:
+    p = evidence_file_path(payment)
+    return bool(p and p.exists() and p.is_file())
+
+
 def notify_admin_pending_slip(db: Session, payment: Payment):
     """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
-    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    target = admin_notify_target(db)
     if not target:
         return
-    slip_url = evidence_url(payment)
     admin_token = settings.ADMIN_TOKEN
+    slip_url = f"{base_url()}/admin/evidence/{payment.id}?token={admin_token}" if evidence_file_exists(payment) else ""
     approve_url = f"{base_url()}/admin/approve/{payment.id}?token={admin_token}"
     reject_url = f"{base_url()}/admin/reject/{payment.id}?token={admin_token}"
     view_url = f"{base_url()}/admin?token={admin_token}#pending"
@@ -390,6 +414,26 @@ def handle_text(reply_token: str, raw: str):
     try:
         s = raw.strip()
         low = s.lower()
+        if low.startswith("ตั้งแอดมิน") or low.startswith("admin set"):
+            # ใช้ในแชทส่วนตัวกับบอท: ตั้งแอดมิน <ADMIN_TOKEN>
+            parts = s.split(maxsplit=1)
+            given = parts[1].strip() if len(parts) > 1 else ""
+            if given != settings.ADMIN_TOKEN:
+                reply(reply_token, [text("รหัสแอดมินไม่ถูกต้องค่ะ\nใช้รูปแบบ: ตั้งแอดมิน ADMIN_TOKEN")])
+                return
+            # save current LINE source as admin target
+            # target is saved in webhook before handle_text; for private chat line_target_id = userId
+            set_state(db, "admin_notify_target_id", get_state(db, "line_target_id"))
+            reply(reply_token, [text(f"✅ ตั้งแอดมินสำหรับรับอนุมัติส่วนตัวแล้ว\nหลังบ้าน: {base_url()}/admin/login")])
+            return
+        if low.startswith("หลังบ้าน") or low.startswith("admin"):
+            parts = s.split(maxsplit=1)
+            given = parts[1].strip() if len(parts) > 1 else ""
+            if given == settings.ADMIN_TOKEN:
+                reply(reply_token, [text(f"🔐 หน้าแอดมิน\n{base_url()}/admin?token={settings.ADMIN_TOKEN}")])
+            else:
+                reply(reply_token, [text("ใช้รูปแบบ: หลังบ้าน ADMIN_TOKEN")])
+            return
         if low in ["เมนู", "menu", "help"]:
             reply(reply_token, [menu_text()])
             return
@@ -629,9 +673,13 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
       function openSchemes(schemes){{
         try{{
           let i=0;
-          function go(){{ if(i>=schemes.length) return; location.href=schemes[i++]; if(i<schemes.length) setTimeout(go,700); }}
+          function go(){{ if(i>=schemes.length) return; location.href=schemes[i++]; if(i<schemes.length) setTimeout(go,650); }}
           go();
         }}catch(e){{}}
+      }}
+      function openKPlus(){{
+        openSchemes(['kplus://','KPLUS://','kplusapp://','kasikornbank://','com.kasikorn.retail.mbanking.wap://','kbank://']);
+        setTimeout(()=>showToast('ถ้า K PLUS ไม่เปิด ให้คัดลอกพร้อมเพย์หรือเซฟ QR ไปสแกนในแอป'),2200);
       }}
       async function saveQR(){{
         let img=document.querySelector('.qr');
@@ -754,6 +802,42 @@ def report_pdf(db: Session = Depends(get_db)):
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
     return Response(make_pdf(r, payments), media_type="application/pdf", headers={"Content-Disposition":"attachment; filename=fundbot_report.pdf"})
 
+@app.get("/admin/evidence/{payment_id}")
+def admin_evidence(payment_id: int, token: str = "", db: Session = Depends(get_db)):
+    if token != settings.ADMIN_TOKEN:
+        raise HTTPException(403)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    path = evidence_file_path(p)
+    if not path or not path.exists() or not path.is_file():
+        raise HTTPException(404, detail="ไม่พบไฟล์หลักฐาน อาจเกิดจากการ redeploy/restart โดยยังไม่ได้ผูก Railway Volume")
+    suffix = path.suffix.lower()
+    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login():
+    return page("Admin Login", """
+    <div class='hero'><div class='title'>🔐 หลังบ้าน FundBot</div><div class='sub'>สำหรับแอดมินอนุมัติสลิป/เงินสด</div></div>
+    <div class='card'>
+      <h2 style='margin-top:0'>เข้าสู่ระบบแอดมิน</h2>
+      <p class='note'>ใส่ ADMIN_TOKEN ที่ตั้งไว้ใน Railway Variables</p>
+      <input id='tok' type='password' placeholder='ADMIN_TOKEN' autocomplete='current-password'>
+      <button class='btn' type='button' onclick='goAdmin()'>เข้าอนุมัติรายการ</button>
+      <a class='btn2' href='/dashboard'>กลับ Dashboard</a>
+    </div>
+    <script>
+      function goAdmin(){
+        const t=document.getElementById('tok').value.trim();
+        if(!t){return}
+        location.href='/admin?token='+encodeURIComponent(t)+'#pending';
+      }
+      document.getElementById('tok').addEventListener('keydown',e=>{if(e.key==='Enter')goAdmin()});
+    </script>
+    """)
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin(token: str = "", db: Session = Depends(get_db)):
     if token != settings.ADMIN_TOKEN:
@@ -764,8 +848,15 @@ def admin(token: str = "", db: Session = Depends(get_db)):
     rows = "".join([f"<div class='member-row'><div class='avatar'>{p.member.name.replace('ท่าน','').strip()[:1] or '?'}</div><b>{p.member.name}</b><b style='text-align:right'>{money(p.due_amount)}</b><span class='status pill {'paid' if p.status=='paid' else ('partial' if p.status=='pending' else 'unpaid')}'>{'✅ ชำระแล้ว' if p.status=='paid' else ('🟡 รอตรวจ' if p.status=='pending' else 'ยังไม่ชำระ')}</span></div>" for p in pays])
     pending_cards = ""
     for p in pending:
-        slip_url = evidence_url(p)
-        img = f"<img src='{slip_url}' style='width:100%;border-radius:18px;border:1px solid #e6eaf2;margin:10px 0'>" if slip_url else "<div class='note'>ไม่มีหลักฐาน</div>"
+        slip_url = f"/admin/evidence/{p.id}?token={token}&v={int(datetime.now().timestamp())}" if evidence_file_exists(p) else ""
+        if slip_url:
+            img = f"""<a href='{slip_url}' target='_blank' rel='noopener'>
+              <img src='{slip_url}' alt='หลักฐานการชำระเงิน'
+                   style='width:100%;max-height:620px;object-fit:contain;background:#f8fafc;border-radius:18px;border:1px solid #e6eaf2;margin:10px 0'
+                   onerror="this.outerHTML='<div class=\'copybox\'><b>รูปหลักฐานเปิดไม่ขึ้น</b><br><span class=\'note\'>ให้กดอัปโหลดใหม่ หรือเช็ก Railway Volume</span></div>'">
+            </a>"""
+        else:
+            img = "<div class='copybox'><b>ไม่พบไฟล์หลักฐาน</b><br><span class='note'>รายการนี้อาจถูกสร้างก่อน deploy รอบล่าสุด หรือยังไม่ได้ตั้ง Railway Volume ให้เก็บไฟล์ถาวร ให้ผู้ใช้ส่งหลักฐานใหม่อีกครั้ง</span></div>"
         pending_cards += f"""
         <div class='card' id='pending'>
           <h3 style='margin:0'>📥 {p.member.name}</h3>
@@ -816,7 +907,7 @@ def admin_approve(payment_id: int, token: str = "", db: Session = Depends(get_db
     p.rejection_reason = None
     db.commit()
     update_line_summary(db)
-    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    target = admin_notify_target(db)
     if target:
         push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท")])
     return RedirectResponse(f"/admin?token={token}#pending", status_code=303)
@@ -844,7 +935,7 @@ def admin_reject(payment_id: int, token: str = Form(...), reason: str = Form(...
     p.note = (p.note or "") + f"\nadmin_rejected:{reason.strip()}"
     db.commit()
     update_line_summary(db)
-    target = settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "line_target_id")
+    target = admin_notify_target(db)
     if target:
         push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nกรุณาอัปโหลดใหม่")])
     return RedirectResponse(f"/admin?token={token}#pending", status_code=303)

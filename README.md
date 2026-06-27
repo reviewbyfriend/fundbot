@@ -24,6 +24,29 @@
   - `/report.docx`
   - `/report.pdf`
 
+
+## หน้าแอดมิน / การอนุมัติส่วนตัว
+
+เข้าแอดมินง่าย ๆ ที่:
+
+```text
+/admin/login
+```
+
+หรือเข้าตรง:
+
+```text
+/admin?token=ADMIN_TOKEN
+```
+
+ถ้าต้องการให้บอทส่งสลิป/ใบเงินสดที่รออนุมัติไปหาแอดมินแบบส่วนตัว ให้ทักบอทในแชทส่วนตัวแล้วพิมพ์:
+
+```text
+ตั้งแอดมิน ADMIN_TOKEN
+```
+
+หลังจากนั้นเมื่อมีคนอัปโหลดสลิปหรือเซ็นรับเงินสด ระบบจะส่งการ์ดอนุมัติไปที่แชทส่วนตัวของแอดมินก่อน ถ้าไม่ได้ตั้งไว้จะ fallback ไปที่กลุ่มล่าสุดที่คุยกับบอท
+
 ## Railway Variables
 
 ```env
@@ -51,3 +74,11 @@ SIGNATURE_STORAGE_DIR=/data/signatures
 
 ## หมายเหตุ
 เวอร์ชันนี้ยังคงแนวทางเดิมของ main คือมี migration compatibility ใน `app/database.py` เพื่อไม่ทำข้อมูลเดิมหาย
+
+
+## v2 Fix: Admin Evidence + K PLUS
+
+- เพิ่ม route `/admin/evidence/{payment_id}` สำหรับเปิดสลิป/ลายเซ็นผ่านหลังบ้านโดยตรง
+- หน้า Admin จะแจ้งชัดเจนถ้าไฟล์หลักฐานหายหลัง redeploy/restart
+- เพิ่ม K PLUS fallback หลาย scheme และไม่ใช้ browser alert
+- แนะนำ Railway: ผูก Volume ที่ `/data` เพื่อให้สลิปและลายเซ็นไม่หายหลัง redeploy
