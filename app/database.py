@@ -39,12 +39,32 @@ def _add_col(conn, table: str, col: str, coltype: str, default: str | None = Non
         sql += f" DEFAULT {default}"
     _exec(conn, sql)
 
+def _drop_not_null(conn, table: str, col: str):
+    """Make old schema columns nullable.
+
+    Earlier FundBot drafts had group_id as NOT NULL. The current MVP no longer uses
+    group_id, so old Railway databases can crash on startup unless this constraint is removed.
+    """
+    if _dialect() != "postgresql":
+        return
+    if not _has_table(conn, table):
+        return
+    if col not in _cols(conn, table):
+        return
+    _exec(conn, f"ALTER TABLE {table} ALTER COLUMN {col} DROP NOT NULL")
+
 def migrate_db():
     d = _dialect()
     money = "NUMERIC(12,2)" if d != "sqlite" else "NUMERIC"
     bool_t = "BOOLEAN"
     ts = "TIMESTAMP" if d != "sqlite" else "DATETIME"
     with engine.begin() as conn:
+        # Compatibility with older FundBot drafts.
+        # Old tables may have group_id marked NOT NULL, but this MVP is single-group
+        # and does not insert group_id. Drop the constraint so existing Railway DBs keep working.
+        for _table in ["members", "rounds", "payments", "expenses"]:
+            _drop_not_null(conn, _table, "group_id")
+
         # Ensure missing columns if DB was created by older versions.
         _add_col(conn, "members", "name", "VARCHAR(120)")
         _add_col(conn, "members", "display_name", "VARCHAR(120)")

@@ -1,39 +1,24 @@
-# FundBot MVP Clean
+# FundBot UI v1
 
-เวอร์ชันแก้พัง/รีเซ็ตให้เรียบง่ายสำหรับใช้งานด่วน:
+อัปเดต UI หน้ารายการสมาชิกและหน้าชำระเงิน
 
-- LINE Group Bot ส่งหน้าเก็บเงินแบบ Flex Message
-- Dashboard เว็บ `/dashboard` อัปเดตทุก 3 วินาที
-- หน้า `/pay` เลือกชื่อ → QR PromptPay → อัปโหลดสลิป
-- เก็บสลิปแยกโฟลเดอร์เดือนใน `/data/slips/<เดือน>/`
-- หลังบ้าน `/admin?token=ADMIN_TOKEN`
-- Migration ป้องกันฐานข้อมูลเก่าคอลัมน์ไม่ตรง
+## สิ่งที่เพิ่ม
+- Dashboard สวยขึ้นแบบการ์ด/สถานะสี
+- หน้าเลือกชื่อมี radio วงกลมหน้าแต่ละชื่อ
+- หน้าโอนเงินมี QR / Copy พร้อมเพย์ / Upload slip แบบเห็นชัด
+- Preview รูปสลิปก่อนอัปโหลด
+- สลิปเก็บแยกตามโฟลเดอร์เดือนใน `SLIP_STORAGE_DIR`
 
-## LINE commands
+## Railway Variables ที่ต้องมี
+- DATABASE_URL
+- LINE_CHANNEL_SECRET
+- LINE_CHANNEL_ACCESS_TOKEN
+- PROMPTPAY_ID
+- PUBLIC_BASE_URL (แนะนำใส่ URL Railway เช่น https://web-production-1b96.up.railway.app)
+- ADMIN_TOKEN (ถ้าใช้หลังบ้าน)
 
-- `เมนู`
+## ใช้ใน LINE
+พิมพ์ในกลุ่ม:
 - `ส่งหน้าเก็บเงิน`
 - `ชำระเงิน`
 - `สรุป`
-- `เปิดรอบ กรกฎาคม 2569`
-
-## Railway Variables
-
-```text
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-LINE_CHANNEL_SECRET=...
-LINE_CHANNEL_ACCESS_TOKEN=...
-PROMPTPAY_ID=เบอร์พร้อมเพย์
-PUBLIC_BASE_URL=https://web-production-1b96.up.railway.app
-ADMIN_TOKEN=ตั้งรหัสหลังบ้าน
-SLIP_STORAGE_DIR=/data/slips
-OCR_SPACE_API_KEY=เว้นว่างได้
-```
-
-## Railway
-
-ให้ลบ Custom Start Command ให้โล่ง หรือใช้:
-
-```text
-sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
-```
