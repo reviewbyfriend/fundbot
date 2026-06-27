@@ -1,56 +1,30 @@
-from pathlib import Path
+from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
-from .db import summary
+from .services import round_summary, money
 
-
-def create_report_xlsx(group_id: str, out_path: str) -> str:
-    data = summary(group_id)
-    if not data:
-        raise ValueError("ยังไม่มีรอบเดือน")
-    r, rows, expenses = data
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "รายงาน"
-    ws["A1"] = "สำนักงานอัยการพิเศษฝ่ายคดีล้มละลาย ๑"
-    ws["A2"] = f"ประจำเดือน {r['title']}"
-    ws["A3"] = "รายรับ"
-    ws["C3"] = "รายจ่าย"
-    bold = Font(bold=True)
-    for cell in ["A1", "A2", "A3", "C3"]:
-        ws[cell].font = bold
-    row = 4
-    ws.cell(row, 1, "ยอดยกมา")
-    ws.cell(row, 2, float(r['brought_forward'] or 0))
-    row += 1
-    total_income = float(r['brought_forward'] or 0)
-    for m in rows:
-        ws.cell(row, 1, m['display_name'])
-        ws.cell(row, 2, float(m['paid_amount'] or 0))
-        total_income += float(m['paid_amount'] or 0)
-        row += 1
-    income_total_row = row
-    ws.cell(row, 1, "รวมรายรับ")
-    ws.cell(row, 2, total_income)
-    exp_row = 4
-    total_exp = 0
-    for e in expenses:
-        ws.cell(exp_row, 3, e['item_date'] or "")
-        ws.cell(exp_row, 4, e['title'])
-        ws.cell(exp_row, 5, float(e['amount']))
-        total_exp += float(e['amount'])
-        exp_row += 1
-    ws.cell(max(income_total_row, exp_row), 4, "รวมรายจ่าย")
-    ws.cell(max(income_total_row, exp_row), 5, total_exp)
-    ws.cell(max(income_total_row, exp_row)+2, 4, "เงินคงเหลือ")
-    ws.cell(max(income_total_row, exp_row)+2, 5, total_income-total_exp)
-    for col, width in [("A", 26),("B", 14),("C", 14),("D", 42),("E", 14)]:
-        ws.column_dimensions[col].width = width
-    thin = Side(style="thin")
-    for row_cells in ws.iter_rows(min_row=3, max_row=max(income_total_row, exp_row)+2, min_col=1, max_col=5):
-        for cell in row_cells:
-            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    wb.save(out_path)
-    return out_path
+def create_report_excel(db, rnd) -> bytes:
+    s = round_summary(db, rnd)
+    wb = Workbook(); ws = wb.active; ws.title = "รายงานกองกลาง"
+    thin = Side(style="thin"); border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.merge_cells("A1:F1"); ws["A1"] = f"รายงานกองกลาง {rnd.title}"; ws["A1"].font = Font(bold=True, size=16); ws["A1"].alignment = Alignment(horizontal="center")
+    ws.append([]); ws.append(["รายรับ", "ยอด", "สถานะ", "รายจ่าย", "ยอด", "วันที่"])
+    for c in ws[3]: c.font = Font(bold=True); c.border = border; c.alignment = Alignment(horizontal="center")
+    members = s["members"]; expenses = s["expenses"]; max_len = max(len(members), len(expenses), 1)
+    for i in range(max_len):
+        m = members[i] if i < len(members) else None
+        e = expenses[i] if i < len(expenses) else None
+        pay = s["payments"].get(m.id) if m else None
+        row = [m.name if m else "", m.monthly_amount if m else "", "จ่ายแล้ว" if pay else ("ค้าง" if m else ""), e.title if e else "", e.amount if e else "", e.created_at.strftime("%d/%m/%Y") if e else ""]
+        ws.append(row)
+    r = ws.max_row + 2
+    ws[f"D{r}"] = "ยอดยกมา"; ws[f"E{r}"] = rnd.brought_forward
+    ws[f"D{r+1}"] = "รายรับ"; ws[f"E{r+1}"] = s["paid"]
+    ws[f"D{r+2}"] = "รายจ่าย"; ws[f"E{r+2}"] = s["expense"]
+    ws[f"D{r+3}"] = "เงินคงเหลือ"; ws[f"E{r+3}"] = s["balance"]; ws[f"D{r+3}"].font = Font(bold=True); ws[f"E{r+3}"].font = Font(bold=True)
+    for row in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=6):
+        for cell in row:
+            cell.border = border
+            if isinstance(cell.value, (int, float)): cell.number_format = '#,##0.00'
+    for col, width in zip("ABCDEF", [28, 14, 14, 35, 14, 15]): ws.column_dimensions[col].width = width
+    bio = BytesIO(); wb.save(bio); return bio.getvalue()

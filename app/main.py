@@ -1,214 +1,221 @@
-from pathlib import Path
-import re
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, Request, Header, HTTPException, Depends, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+import re
+from .database import init_db, get_db, SessionLocal
 from .config import settings
-from .database import Base, engine, db_session
-from .models import Group, Member
-from . import line_client
-from .services import (
-    get_or_create_group, add_member, bind_member, open_round, mark_paid, add_expense,
-    summary_text, remind_text, my_due, is_admin, money, current_round, find_member, process_slip_payment
-)
-from .promptpay import build_promptpay_payload, qr_png_base64
-from .reports import create_excel_report
+from .line_client import verify_signature, reply, text_message, image_message, download_content
+from .promptpay import make_qr_png
 from .slip_ocr import ocr_space, receiver_ok
-from .importers import import_members_from_excel
+from .report import create_report_excel
+from .services import *
 
-Base.metadata.create_all(bind=engine)
-app = FastAPI(title="Office Fund LINE Bot", version="1.0.0")
+app = FastAPI(title="FundBot v1.0")
+QR_CACHE: dict[str, bytes] = {}
+REPORT_CACHE: dict[str, bytes] = {}
 
-HELP = """คำสั่งหลัก
-- ลงทะเบียน ชื่อของฉัน
-- ชำระเงิน
-- จ่ายแล้ว 500
+@app.on_event("startup")
+def startup():
+    init_db()
 
-คำสั่งแอดมิน
-- เพิ่มสมาชิก ชื่อ 500
-- เปิดรอบ กรกฎาคม 2569 ยกมา 1000
-- รับเงิน ชื่อ 500
-- รายจ่าย ค่าน้ำ 1816
-- สรุป
-- ทวงเงิน
-- รายงาน
-"""
+@app.get("/")
+def root():
+    return {"ok": True, "name": "FundBot v1.0", "webhook": "/webhook"}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "office-fund-line-bot"}
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html><body style='font-family:sans-serif;padding:32px'>
-    <h2>Office Fund LINE Bot is running ✅</h2>
-    <p>Webhook: <code>/webhook</code></p>
-    <p>Health: <code>/health</code></p>
-    </body></html>
-    """
-
-@app.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(db_session)):
-    body = await request.body()
-    signature = request.headers.get("x-line-signature")
-    if not line_client.verify_signature(body, signature):
-        raise HTTPException(status_code=400, detail="Invalid LINE signature")
-    payload = await request.json()
-    for event in payload.get("events", []):
-        handle_event(db, event)
     return {"ok": True}
 
+@app.get("/qr/{key}.png")
+def qr_png(key: str):
+    data = QR_CACHE.get(key)
+    if not data:
+        raise HTTPException(404, "QR not found")
+    return Response(content=data, media_type="image/png")
 
-def handle_event(db: Session, event: dict):
+@app.get("/report/{key}.xlsx")
+def report_xlsx(key: str):
+    data = REPORT_CACHE.get(key)
+    if not data:
+        raise HTTPException(404, "Report not found")
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=fund-report-{key}.xlsx"})
+
+def src_ids(event: dict):
     source = event.get("source", {})
-    reply_token = event.get("replyToken")
-    user_id = source.get("userId")
-    group_id = source.get("groupId") or source.get("roomId") or user_id or "private"
-    group = get_or_create_group(db, group_id)
+    group_id = source.get("groupId") or source.get("roomId") or source.get("userId") or "private"
+    user_id = source.get("userId", "")
+    return group_id, user_id
 
-    if event.get("type") == "join":
-        line_client.reply(reply_token, line_client.text_message("สวัสดีจ้า ฉันคือบอทเก็บเงินกองกลาง\nพิมพ์ 'ช่วยเหลือ' เพื่อดูคำสั่ง"))
-        return
+def help_text():
+    return """🤖 FundBot กองกลางสำนักงาน
 
-    if event.get("type") != "message":
-        return
-    msg = event.get("message", {})
-    msg_type = msg.get("type")
+คำสั่งหลัก
+• เพิ่มสมาชิก รักษิน 500
+• รายชื่อ
+• เปิดรอบ กรกฎาคม 2569 ยกมา 17813.50
+• ลงทะเบียน รักษิน
+• ยอดของฉัน
+• ชำระเงิน
+• จ่ายแล้ว 500
+• รับเงิน รักษิน 500
+• รายจ่าย ค่าน้ำ 1816
+• สรุป
+• ทวงเงิน
+• รายงาน
 
-    if msg_type == "image":
-        message_id = msg.get("id")
-        image_bytes = line_client.get_message_content(message_id) if message_id else None
-        if not image_bytes:
-            line_client.reply(reply_token, line_client.text_message(
-                "📎 รับรูปแล้ว แต่ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ\nให้พิมพ์ยืนยันยอด เช่น 'จ่ายแล้ว 500'"
-            ))
-            return
-        result = ocr_space(image_bytes)
-        if not result.ok:
-            line_client.reply(reply_token, line_client.text_message(
-                f"📎 รับสลิปแล้ว แต่ OCR อ่านไม่สำเร็จ\nสาเหตุ: {result.error}\nให้พิมพ์ยืนยันยอด เช่น 'จ่ายแล้ว 500'"
-            ))
-            return
-        ok, response = process_slip_payment(
-            db, group, user_id, message_id or "", result.amount, result.reference_no, result.raw_text, receiver_ok(result.raw_text)
-        )
-        line_client.reply(reply_token, line_client.text_message(response))
-        return
+ส่งสลิปเป็นรูปได้ ถ้าตั้ง OCR_SPACE_API_KEY แล้วระบบจะพยายามอ่านยอดให้อัตโนมัติ"""
 
-    if msg_type != "text":
-        return
-    text = (msg.get("text") or "").strip()
-    response = handle_text(db, group, user_id, text)
-    if isinstance(response, list):
-        line_client.reply(reply_token, response)
-    else:
-        line_client.reply(reply_token, line_client.text_message(response))
+def parse_amount(text: str) -> float | None:
+    m = re.search(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?|[0-9]+(?:\.\d+)?)", text)
+    if not m: return None
+    return float(m.group(1).replace(",", ""))
 
-
-def handle_text(db: Session, group: Group, user_id: str | None, text: str):
-    admin = is_admin(user_id, settings.admin_ids) or not settings.admin_ids  # ช่วงทดลอง ถ้ายังไม่ตั้ง ADMIN ให้ทุกคนทดสอบได้
+def handle_text(db: Session, event: dict, text: str):
+    group_line_id, user_id = src_ids(event)
+    group = get_group(db, group_line_id)
     t = text.strip()
 
-    if t in ["ช่วยเหลือ", "help", "Help", "เมนู"]:
-        return HELP
+    if t in ["ช่วย", "ช่วยเหลือ", "help", "Help"]:
+        return help_text()
 
-    m = re.match(r"^ลงทะเบียน\s+(.+)$", t)
-    if m:
-        member = bind_member(db, group, user_id or "", m.group(1).strip())
-        if member:
-            return f"✅ ลงทะเบียนแล้ว\n{member.display_name}\nยอดประจำเดือน {money(member.monthly_amount):,.2f} บาท"
-        return "ไม่พบชื่อนี้ในรายชื่อสมาชิก ให้แอดมินเพิ่มก่อน เช่น\nเพิ่มสมาชิก รักษิน 500"
+    if t.startswith("เพิ่มสมาชิก"):
+        m = re.match(r"เพิ่มสมาชิก\s+(.+?)\s+([0-9,]+(?:\.\d+)?)$", t)
+        if not m: return "รูปแบบ: เพิ่มสมาชิก รักษิน 500"
+        name, amount = m.group(1).strip(), float(m.group(2).replace(",", ""))
+        add_member(db, group, name, amount)
+        return f"✅ เพิ่ม/แก้สมาชิกแล้ว\n{name}: {money(amount)} บาท"
 
-    m = re.match(r"^เพิ่มสมาชิก\s+(.+?)\s+(\d+(?:\.\d+)?)$", t)
-    if m:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        member = add_member(db, group, m.group(1).strip(), float(m.group(2)))
-        return f"✅ เพิ่ม/แก้ไขสมาชิกแล้ว\n{member.display_name}: {money(member.monthly_amount):,.2f} บาท"
+    if t == "รายชื่อ":
+        members = db.query(Member).filter_by(group_id=group.id, active=1).order_by(Member.name).all()
+        if not members: return "ยังไม่มีสมาชิก\nพิมพ์: เพิ่มสมาชิก รักษิน 500"
+        return "👥 รายชื่อสมาชิก\n" + "\n".join([f"• {m.name} {money(m.monthly_amount)}" + (" ✅ลงทะเบียน" if m.line_user_id else "") for m in members])
 
-    m = re.match(r"^เปิดรอบ\s+(.+?)(?:\s+ยกมา\s+(\d+(?:\.\d+)?))?$", t)
-    if m:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        month_label = m.group(1).strip()
-        opening = float(m.group(2) or 0)
-        r = open_round(db, group, month_label, opening)
-        return f"✅ เปิดรอบ {r.month_label} แล้ว\nยอดยกมา {money(r.opening_balance):,.2f} บาท\nพิมพ์ 'สรุป' เพื่อดูยอดทั้งหมด"
+    if t.startswith("เปิดรอบ"):
+        rest = t.replace("เปิดรอบ", "", 1).strip()
+        bf = 0.0
+        title = rest
+        m = re.search(r"ยกมา\s+([0-9,]+(?:\.\d+)?)", rest)
+        if m:
+            bf = float(m.group(1).replace(",", ""))
+            title = rest[:m.start()].strip()
+        if not title: return "รูปแบบ: เปิดรอบ กรกฎาคม 2569 ยกมา 17813.50"
+        rnd = open_round(db, group, title, bf)
+        members = db.query(Member).filter_by(group_id=group.id, active=1).all()
+        total = sum(x.monthly_amount for x in members)
+        return f"✅ เปิดรอบ {rnd.title}\nยอดยกมา {money(bf)} บาท\nสมาชิก {len(members)} คน\nยอดที่ต้องเก็บ {money(total)} บาท"
 
-    if t in ["สรุป", "สรุปยอด", "ใครยังไม่จ่าย"]:
-        return summary_text(db, group)
+    if t.startswith("ลงทะเบียน"):
+        name = t.replace("ลงทะเบียน", "", 1).strip()
+        if not name: return "รูปแบบ: ลงทะเบียน รักษิน"
+        m = register_user(db, group, user_id, name)
+        if not m: return f"ไม่พบชื่อ {name}\nให้แอดมินเพิ่มก่อน: เพิ่มสมาชิก {name} 500"
+        return f"✅ ลงทะเบียนสำเร็จ\nLINE นี้ผูกกับ: {m.name}\nยอดประจำเดือน: {money(m.monthly_amount)} บาท"
 
-    if t in ["ทวงเงิน", "เตือนจ่ายเงิน"]:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        return remind_text(db, group)
+    if t in ["ยอดของฉัน", "ชำระเงิน"]:
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่\nพิมพ์: เปิดรอบ กรกฎาคม 2569"
+        member = member_by_user(db, group, user_id)
+        if not member: return "ยังไม่รู้ว่าคุณคือใคร\nพิมพ์: ลงทะเบียน ชื่อของคุณ"
+        p = db.query(Payment).filter_by(round_id=rnd.id, member_id=member.id).first()
+        if p: return f"✅ {member.name} จ่ายแล้ว\nรอบ {rnd.title}\nจำนวน {money(p.amount)} บาท"
+        if t == "ยอดของฉัน": return f"📌 {member.name}\nรอบ {rnd.title}\nยอดต้องชำระ {money(member.monthly_amount)} บาท"
+        if not settings.promptpay_id: return "ยังไม่ได้ตั้ง PROMPTPAY_ID ใน Railway"
+        key = f"{rnd.id}-{member.id}"
+        QR_CACHE[key] = make_qr_png(settings.promptpay_id, member.monthly_amount)
+        url = f"{settings.app_base_url.rstrip('/')}/qr/{key}.png"
+        reply(event["replyToken"], [text_message(f"💳 {member.name}\nยอดชำระ {money(member.monthly_amount)} บาท\nสแกน QR แล้วส่งสลิปกลับมาในกลุ่มได้เลย"), image_message(url)])
+        return None
 
-    if t in ["ชำระเงิน", "จ่ายเงิน", "ขอ qr", "QR", "qr"]:
-        due = my_due(db, group, user_id)
-        if not due:
-            return "ยังไม่พบยอดของคุณ\nให้พิมพ์: ลงทะเบียน ชื่อของคุณ"
-        remain = max(0, money(due.amount_due) - money(due.amount_paid))
-        if remain <= 0:
-            return f"✅ คุณชำระครบแล้ว\n{due.member.display_name}"
-        url = f"{settings.app_base_url.rstrip('/')}/pay/{due.id}"
-        return [line_client.payment_flex(f"{settings.fund_name}", remain, url)]
+    if t.startswith("จ่ายแล้ว"):
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่"
+        member = member_by_user(db, group, user_id)
+        if not member: return "ยังไม่ได้ลงทะเบียน\nพิมพ์: ลงทะเบียน ชื่อของคุณ"
+        amt = parse_amount(t)
+        if amt is None: return "รูปแบบ: จ่ายแล้ว 500"
+        record_payment(db, rnd, member, amt, source="manual")
+        return f"✅ บันทึกแล้ว\n{member.name} ชำระ {money(amt)} บาท\nรอบ {rnd.title}"
 
-    m = re.match(r"^จ่ายแล้ว\s+(\d+(?:\.\d+)?)$", t)
-    if m:
-        ok, msg = mark_paid(db, group, user_id, float(m.group(1)))
-        return msg
+    if t.startswith("รับเงิน"):
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่"
+        m = re.match(r"รับเงิน\s+(.+?)\s+([0-9,]+(?:\.\d+)?)$", t)
+        if not m: return "รูปแบบ: รับเงิน รักษิน 500"
+        member = find_member(db, group, m.group(1).strip())
+        if not member: return "ไม่พบสมาชิก"
+        amt = float(m.group(2).replace(",", ""))
+        record_payment(db, rnd, member, amt, source="admin")
+        return f"✅ รับเงินแล้ว\n{member.name}: {money(amt)} บาท"
 
-    m = re.match(r"^รับเงิน\s+(.+?)\s+(\d+(?:\.\d+)?)$", t)
-    if m:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        ok, msg = mark_paid(db, group, user_id, float(m.group(2)), member_keyword=m.group(1).strip())
-        return msg
+    if t.startswith("รายจ่าย"):
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่"
+        m = re.match(r"รายจ่าย\s+(.+?)\s+([0-9,]+(?:\.\d+)?)$", t)
+        if not m: return "รูปแบบ: รายจ่าย ค่าน้ำ 1816"
+        title, amt = m.group(1).strip(), float(m.group(2).replace(",", ""))
+        add_expense(db, rnd, title, amt)
+        return f"✅ เพิ่มรายจ่ายแล้ว\n{title}: {money(amt)} บาท"
 
-    m = re.match(r"^รายจ่าย\s+(.+?)\s+(\d+(?:\.\d+)?)$", t)
-    if m:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        ok, msg = add_expense(db, group, m.group(1).strip(), float(m.group(2)))
-        return msg
+    if t in ["สรุป", "ใครยังไม่จ่าย", "ทวงเงิน"]:
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่"
+        s = round_summary(db, rnd)
+        lines = [f"📊 สรุป {rnd.title}", f"ยอดยกมา {money(rnd.brought_forward)}", f"รับแล้ว {money(s['paid'])}", f"รายจ่าย {money(s['expense'])}", f"คงเหลือ {money(s['balance'])}", ""]
+        if s["unpaid"]:
+            lines.append(f"ยังไม่จ่าย {len(s['unpaid'])} คน")
+            lines.extend([f"• {m.name} {money(m.monthly_amount)}" for m in s["unpaid"]])
+        else:
+            lines.append("✅ จ่ายครบแล้ว")
+        return "\n".join(lines)
 
-    if t in ["รายงาน", "สร้างรายงาน"]:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        path = create_excel_report(db, group)
-        url = f"{settings.app_base_url.rstrip()}/download/{path.name}"
-        return f"✅ สร้างรายงานแล้ว\nดาวน์โหลด: {url}"
+    if t == "รายงาน":
+        rnd = current_round(db, group)
+        if not rnd: return "ยังไม่มีรอบเปิดอยู่"
+        key = f"{group.id}-{rnd.id}"
+        REPORT_CACHE[key] = create_report_excel(db, rnd)
+        url = f"{settings.app_base_url.rstrip('/')}/report/{key}.xlsx"
+        return f"📄 รายงาน Excel\n{rnd.title}\nดาวน์โหลด:\n{url}"
 
-    m = re.match(r"^นำเข้าไฟล์ตัวอย่าง$", t)
-    if m:
-        if not admin: return "คำสั่งนี้ใช้ได้เฉพาะแอดมิน"
-        count = import_members_from_excel(db, group, "data/sample_fund_2569.xlsx")
-        return f"✅ นำเข้ารายชื่อจากไฟล์ตัวอย่างแล้ว {count} รายการ"
+    return None
 
-    return "ยังไม่เข้าใจคำสั่งนี้จ้า\nพิมพ์ 'ช่วยเหลือ' เพื่อดูคำสั่ง"
+def handle_image(db: Session, event: dict):
+    group_line_id, user_id = src_ids(event)
+    group = get_group(db, group_line_id)
+    rnd = current_round(db, group)
+    if not rnd: return "ได้รับรูปแล้ว แต่ยังไม่มีรอบเปิดอยู่"
+    member = member_by_user(db, group, user_id)
+    if not member: return "ได้รับสลิปแล้ว แต่ยังไม่รู้ว่าคุณคือใคร\nพิมพ์ก่อน: ลงทะเบียน ชื่อของคุณ"
+    img = download_content(event["message"]["id"])
+    text, amt, ref = ocr_space(img)
+    if not amt:
+        return "รับสลิปแล้ว แต่ OCR ยังอ่านยอดไม่ได้\nกรุณาพิมพ์ยืนยัน: จ่ายแล้ว 500"
+    if text and not receiver_ok(text):
+        return f"⚠️ OCR อ่านยอดได้ {money(amt)} บาท แต่ยังไม่พบชื่อบัญชีรับเงินที่ตั้งไว้\nกรุณาให้แอดมินตรวจสอบ หรือพิมพ์: จ่ายแล้ว {money(amt)}"
+    existing = db.query(Payment).filter_by(round_id=rnd.id, slip_ref=ref).first()
+    if existing:
+        return "⚠️ สลิปนี้เคยถูกใช้บันทึกแล้ว"
+    record_payment(db, rnd, member, amt, source="ocr", slip_ref=ref, note=text[:1000] if text else None)
+    return f"✅ OCR รับชำระแล้ว\n{member.name}\nจำนวน {money(amt)} บาท\nรอบ {rnd.title}"
 
-@app.get("/pay/{due_id}", response_class=HTMLResponse)
-def pay_page(due_id: int, db: Session = Depends(db_session)):
-    from .models import PaymentDue
-    due = db.get(PaymentDue, due_id)
-    if not due:
-        raise HTTPException(404, "Payment not found")
-    remain = max(0, money(due.amount_due) - money(due.amount_paid))
-    payload = build_promptpay_payload(settings.promptpay_id, remain)
-    img64 = qr_png_base64(payload)
-    return f"""
-    <html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
-    <style>body{{font-family:sans-serif;text-align:center;padding:20px}} img{{width:280px;max-width:90%}} .amt{{font-size:28px;font-weight:bold}}</style></head>
-    <body>
-      <h2>{settings.fund_name}</h2>
-      <p>{due.member.display_name}</p>
-      <div class='amt'>{remain:,.2f} บาท</div>
-      <p>สแกน QR ด้วยแอปธนาคาร แล้วส่งสลิปกลับใน LINE กลุ่ม</p>
-      <img src='data:image/png;base64,{img64}' />
-      <p style='font-size:12px;color:#666'>PromptPay: {settings.promptpay_id}</p>
-    </body></html>
-    """
-
-@app.get("/download/{filename}")
-def download(filename: str):
-    safe = Path(filename).name
-    path = Path("reports") / safe
-    if not path.exists():
-        raise HTTPException(404, "file not found")
-    return FileResponse(path, filename=safe)
+@app.post("/webhook")
+async def webhook(request: Request, x_line_signature: str | None = Header(default=None)):
+    body = await request.body()
+    if not verify_signature(body, x_line_signature):
+        raise HTTPException(status_code=400, detail="Invalid LINE signature")
+    payload = await request.json()
+    db = SessionLocal()
+    try:
+        for event in payload.get("events", []):
+            if event.get("type") != "message":
+                continue
+            msg = event.get("message", {})
+            out = None
+            if msg.get("type") == "text":
+                out = handle_text(db, event, msg.get("text", ""))
+            elif msg.get("type") == "image":
+                out = handle_image(db, event)
+            if out:
+                reply(event["replyToken"], text_message(out))
+    finally:
+        db.close()
+    return JSONResponse({"ok": True})
