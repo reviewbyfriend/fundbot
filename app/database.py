@@ -116,6 +116,7 @@ def migrate_db():
         # Bot state stores the latest LINE group/room/user target so the app can push an updated card after payment.
         _add_col(conn, "bot_state", "value", "TEXT")
         _add_col(conn, "bot_state", "updated_at", ts)
+        _add_col(conn, "admin_users", "line_user_id", "VARCHAR(120)")
 
 def init_db():
     from . import models  # noqa

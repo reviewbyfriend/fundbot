@@ -113,8 +113,42 @@ def get_state(db: Session, key: str) -> str | None:
 
 
 def admin_notify_target(db: Session) -> str | None:
-    # ส่งรายการรออนุมัติไปหาแอดมินส่วนตัวก่อน ถ้าไม่ได้ตั้งไว้จึง fallback ไปกลุ่มล่าสุด
-    return settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "admin_notify_target_id") or get_state(db, "line_target_id")
+    # Backward compatible single target. Prefer explicit env or legacy private target.
+    return settings.ADMIN_NOTIFY_TARGET_ID or get_state(db, "admin_notify_target_id")
+
+
+def admin_notify_targets(db: Session) -> list[str]:
+    """Return private LINE userIds for active admins who can approve.
+
+    Group messages should not receive slip approval cards. If no LINE-registered admin exists,
+    fallback to legacy ADMIN_NOTIFY_TARGET_ID/admin_notify_target_id only.
+    """
+    targets: list[str] = []
+    try:
+        admins = db.query(AdminUser).filter(
+            AdminUser.active == True,
+            AdminUser.role.in_(["owner", "approver"]),
+            AdminUser.line_user_id.isnot(None),
+        ).all()
+        for a in admins:
+            if a.line_user_id and a.line_user_id not in targets:
+                targets.append(a.line_user_id)
+    except Exception:
+        pass
+    legacy = admin_notify_target(db)
+    if legacy and not targets:
+        targets.append(legacy)
+    return targets
+
+
+def line_admin_for_user(db: Session, user_id: str | None):
+    if not user_id:
+        return None
+    return db.query(AdminUser).filter(AdminUser.line_user_id == user_id, AdminUser.active == True).first()
+
+
+def role_allows(role: str | None, allowed: tuple[str, ...]) -> bool:
+    return bool(role and role in allowed)
 
 
 def admin_code_hash(code: str) -> str:
@@ -201,14 +235,20 @@ def admin_return_url(token: str = "") -> str:
 
 def save_line_target(db: Session, event: dict):
     source = event.get("source", {}) or {}
-    target = source.get("groupId") or source.get("roomId") or source.get("userId")
-    if target:
-        set_state(db, "line_target_id", target)
+    # เก็บ group/room ล่าสุดไว้สำหรับส่งการ์ดเรียกเก็บหรือสรุปรายงานเข้ากลุ่ม
+    if source.get("groupId"):
+        set_state(db, "line_group_target_id", source.get("groupId"))
+        set_state(db, "line_target_id", source.get("groupId"))
+    elif source.get("roomId"):
+        set_state(db, "line_group_target_id", source.get("roomId"))
+        set_state(db, "line_target_id", source.get("roomId"))
+    elif source.get("userId"):
+        set_state(db, "line_last_user_id", source.get("userId"))
 
 
 def update_line_summary(db: Session):
     """LINE messages cannot be edited after sending, so push a fresh updated card."""
-    target = get_state(db, "line_target_id")
+    target = get_state(db, "line_group_target_id") or get_state(db, "line_target_id")
     if target:
         push(target, [collection_flex(db)])
 
@@ -292,14 +332,15 @@ def evidence_file_exists(payment: Payment) -> bool:
 
 def notify_admin_pending_slip(db: Session, payment: Payment):
     """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
-    target = admin_notify_target(db)
-    if not target:
+    targets = admin_notify_targets(db)
+    if not targets:
         return
-    admin_token = settings.ADMIN_TOKEN
-    slip_url = f"{base_url()}/admin/evidence/{payment.id}?token={admin_token}" if evidence_file_exists(payment) else ""
-    approve_url = f"{base_url()}/admin/approve/{payment.id}?token={admin_token}"
-    reject_url = f"{base_url()}/admin/reject/{payment.id}?token={admin_token}"
-    view_url = f"{base_url()}/admin?token={admin_token}#pending"
+    # ไม่ส่ง token ใน URL เพื่อให้แต่ละแอดมิน login ด้วย Admin Code ของตัวเอง
+    # จะได้บันทึกได้ว่าใครเป็นคนอนุมัติ/ปฏิเสธ
+    slip_url = f"{base_url()}/admin/evidence/{payment.id}" if evidence_file_exists(payment) else ""
+    approve_url = f"{base_url()}/admin/approve/{payment.id}"
+    reject_url = f"{base_url()}/admin/reject/{payment.id}"
+    view_url = f"{base_url()}/admin#pending"
     contents = {
         "type": "bubble",
         "size": "mega",
@@ -331,7 +372,8 @@ def notify_admin_pending_slip(db: Session, payment: Payment):
     }
     if slip_url:
         contents["hero"] = {"type": "image", "url": slip_url, "size": "full", "aspectRatio": "16:10", "aspectMode": "cover"}
-    push(target, [flex("มีสลิปรอตรวจ", contents)])
+    for target in targets:
+        push(target, [flex("มีสลิปรอตรวจ", contents)])
 
 def ocr_space_text(image_path: Path) -> str:
     if not settings.OCR_SPACE_API_KEY:
@@ -647,28 +689,83 @@ async def webhook(req: Request):
         token = ev.get("replyToken")
         msg = ev.get("message", {})
         if msg.get("type") == "text":
-            handle_text(token, msg.get("text", ""))
+            handle_text(token, msg.get("text", ""), ev.get("source", {}) or {})
         elif msg.get("type") == "image":
             handle_line_image(token, msg.get("id", ""))
     return {"ok": True}
 
-def handle_text(reply_token: str, raw: str):
+def handle_text(reply_token: str, raw: str, source: dict | None = None):
     db = SessionLocal()
     try:
+        source = source or {}
+        source_type = source.get("type")
+        user_id = source.get("userId")
         s = raw.strip()
         low = s.lower()
-        if low.startswith("ตั้งแอดมิน") or low.startswith("admin set"):
-            # ใช้ในแชทส่วนตัวกับบอท: ตั้งแอดมิน <ADMIN_TOKEN>
-            parts = s.split(maxsplit=1)
-            given = parts[1].strip() if len(parts) > 1 else ""
-            if given != settings.ADMIN_TOKEN:
-                reply(reply_token, [text("รหัสแอดมินไม่ถูกต้องค่ะ\nใช้รูปแบบ: ตั้งแอดมิน ADMIN_TOKEN")])
-                return
-            # save current LINE source as admin target
-            # target is saved in webhook before handle_text; for private chat line_target_id = userId
-            set_state(db, "admin_notify_target_id", get_state(db, "line_target_id"))
-            reply(reply_token, [text(f"✅ ตั้งแอดมินสำหรับรับอนุมัติส่วนตัวแล้ว\nหลังบ้าน: {base_url()}/admin/login")])
+
+        # ในกลุ่มให้บอททำงานเฉพาะข้อความที่ขึ้นต้นด้วย @fundbot กันตอบมั่วตอนคนคุยกัน
+        is_group_chat = source_type in ["group", "room"]
+        is_mentioned = low.startswith("@fundbot")
+        command = s[len("@fundbot"):].strip() if is_mentioned else s
+        cmd_low = command.lower().strip()
+        line_admin = line_admin_for_user(db, user_id)
+        line_role = getattr(line_admin, "role", None) if line_admin else None
+
+        if is_group_chat and not is_mentioned:
             return
+
+        if cmd_low.startswith("สมัครแอดมิน") or cmd_low.startswith("ลงทะเบียนแอดมิน") or low.startswith("ตั้งแอดมิน") or low.startswith("admin set"):
+            # ใช้ในแชตส่วนตัวกับบอทเท่านั้น: @fundbot สมัครแอดมิน <Admin Code>
+            if source_type != "user" or not user_id:
+                reply(reply_token, [text("สมัครแอดมินต้องทำในแชตส่วนตัวกับบอทนะคะ")])
+                return
+            parts = command.split(maxsplit=1) if is_mentioned else s.split(maxsplit=1)
+            given = parts[1].strip() if len(parts) > 1 else ""
+            ensure_owner_admin(db)
+            matched = None
+            if given == settings.ADMIN_TOKEN:
+                matched = db.query(AdminUser).filter(AdminUser.role == "owner", AdminUser.active == True).order_by(AdminUser.id).first()
+            if not matched:
+                for a in db.query(AdminUser).filter(AdminUser.active == True).all():
+                    if verify_admin_code(given, a.code_hash):
+                        matched = a
+                        break
+            if not matched:
+                reply(reply_token, [text("Admin Code ไม่ถูกต้องค่ะ")])
+                return
+            matched.line_user_id = user_id
+            matched.last_login_at = datetime.utcnow()
+            db.commit()
+            set_state(db, "admin_notify_target_id", user_id)  # legacy fallback
+            audit_admin(db, {"id": matched.id, "name": matched.name, "role": matched.role}, "line_admin_register", detail=user_id)
+            reply(reply_token, [text(f"✅ ลงทะเบียนแอดมินสำเร็จ\nชื่อ: {matched.name}\nสิทธิ์: {matched.role}\nต่อไปสลิปรอตรวจจะเด้งมาที่แชตส่วนตัวนี้")])
+            return
+
+        if is_mentioned and cmd_low in ["สิทธิ์", "ฉันเป็นใคร", "whoami"]:
+            if line_admin:
+                reply(reply_token, [text(f"คุณเป็นแอดมิน: {line_admin.name}\nสิทธิ์: {line_admin.role}")])
+            else:
+                reply(reply_token, [text("คุณยังไม่ได้ลงทะเบียนเป็นแอดมินค่ะ")])
+            return
+
+        if is_mentioned and cmd_low in ["รอตรวจ", "รายการรอตรวจ", "อนุมัติ"]:
+            if not role_allows(line_role, ("owner", "approver")):
+                reply(reply_token, [text("คำสั่งนี้สำหรับ Approver/Owner เท่านั้นค่ะ")])
+                return
+            reply(reply_token, [text(f"📥 รายการรอตรวจ\n{base_url()}/admin#pending")])
+            return
+
+        if is_mentioned and any(cmd_low.startswith(x) for x in ["เรียกเก็บ", "ส่งหน้าเก็บเงิน", "เก็บเงิน"]):
+            if not role_allows(line_role, ("owner",)):
+                reply(reply_token, [text("คำสั่งนี้สำหรับ Owner เท่านั้นค่ะ")])
+                return
+            reply(reply_token, [collection_flex(db)])
+            return
+
+        if is_mentioned and cmd_low in ["สถานะของฉัน", "จ่ายยัง", "ยอดของฉัน"]:
+            reply(reply_token, [text(f"ดูสถานะและชำระเงินได้ที่\n{base_url()}/dashboard")])
+            return
+
         if low.startswith("หลังบ้าน") or low.startswith("admin"):
             parts = s.split(maxsplit=1)
             given = parts[1].strip() if len(parts) > 1 else ""
@@ -677,6 +774,10 @@ def handle_text(reply_token: str, raw: str):
             else:
                 reply(reply_token, [text("ใช้รูปแบบ: หลังบ้าน ADMIN_TOKEN")])
             return
+        if is_mentioned:
+            low = cmd_low
+            s = command
+
         if low in ["เมนู", "menu", "help"]:
             reply(reply_token, [menu_text()])
             return
@@ -1337,13 +1438,13 @@ def admin_users(request: Request, token: str = "", db: Session = Depends(get_db)
             <input name='code' placeholder='ตั้ง Admin Code ส่วนตัว' required>
             <button class='btn'>บันทึกแอดมิน</button>
           </form>
-          <p class='note'>ส่ง Admin Code ให้เฉพาะคนที่ไว้ใจได้ แต่ละคนใช้คนละรหัส เวลาอนุมัติระบบจะบันทึกชื่อไว้</p>
+          <p class='note'>ส่ง Admin Code ให้เฉพาะคนที่ไว้ใจได้ แล้วให้แต่ละคนพิมพ์ในแชตส่วนตัวกับบอท: @fundbot สมัครแอดมิน <Admin Code></p>
         </div>
         """
     else:
         add_form = "<div class='copybox'>เฉพาะ Owner เท่านั้นที่เพิ่ม/แก้แอดมินได้</div>"
     return page("Admins", f"""
-    <div class='hero'><div class='title'>👥 แอดมินหลายคน</div><div class='sub'>ไม่ผูก LINE ID · ใช้ Admin Code แยกคน</div></div>
+    <div class='hero'><div class='title'>👥 แอดมินหลายคน</div><div class='sub'>ผูก LINE เฉพาะแอดมิน · ใช้ Admin Code แยกคน</div></div>
     <div class='top-actions'><a class='btn2' href='/admin{query}'>กลับหน้าอนุมัติ</a><a class='btn2' href='/admin/logout'>ออกจากระบบ</a></div>
     {add_form}
     <div class='card'><h3>รายชื่อแอดมิน</h3>{rows}</div>
@@ -1387,8 +1488,7 @@ def admin_approve(payment_id: int, request: Request, token: str = "", db: Sessio
     db.commit()
     audit_admin(db, admin_ctx, "approve", p.id, f"{p.member.name} {money(p.due_amount)} {ptype}")
     update_line_summary(db)
-    target = admin_notify_target(db)
-    if target:
+    for target in admin_notify_targets(db):
         push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท\nโดย: {admin_ctx['name']}")])
     return RedirectResponse(admin_return_url(token), status_code=303)
 
@@ -1417,8 +1517,7 @@ def admin_reject(payment_id: int, request: Request, token: str = Form(""), reaso
     db.commit()
     audit_admin(db, admin_ctx, "reject", p.id, f"{p.member.name}: {reason.strip()}")
     update_line_summary(db)
-    target = admin_notify_target(db)
-    if target:
+    for target in admin_notify_targets(db):
         push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nโดย: {admin_ctx['name']}\nกรุณาอัปโหลดใหม่")])
     return RedirectResponse(admin_return_url(token), status_code=303)
 

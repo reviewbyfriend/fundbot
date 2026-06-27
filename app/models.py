@@ -73,6 +73,7 @@ class AdminUser(Base):
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
+    line_user_id = Column(String(120), unique=True, nullable=True)
 
 
 class AdminAuditLog(Base):
