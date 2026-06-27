@@ -25,7 +25,7 @@ from .database import SessionLocal, get_db, init_db
 from . import services
 from .line_client import flex, reply, push, text, download_message_content
 from .promptpay import qr_png_base64
-from .report import make_excel, make_word, make_pdf
+from .report import make_excel, make_word, make_pdf, report_summary
 from PIL import Image, ImageOps
 from .models import Expense, Payment, BotState, AdminUser, AdminAuditLog
 from .timezone import now_bangkok, format_th
@@ -483,8 +483,60 @@ def report_links_text():
         f"Excel: {base_url()}/report.xlsx\n"
         f"Word: {base_url()}/report.docx\n"
         f"PDF: {base_url()}/report.pdf\n\n"
-        "ถ้าจะปริ้น แนะนำเปิด Excel/Word แล้วสั่งพิมพ์จากเครื่องค่ะ"
+        "ไฟล์ Excel จะใช้แม่แบบเดิม เปลี่ยนเฉพาะตัวเลข/ข้อมูลด้านในค่ะ"
     )
+
+
+
+
+def report_summary_flex(db: Session):
+    r = services.active_round(db)
+    if not r:
+        return text("ยังไม่มีรอบรายงาน")
+    payments = db.query(Payment).filter(Payment.round_id == r.id).all()
+    expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date, Expense.id).all()
+    s = report_summary(r, payments, expenses)
+    exp_rows = []
+    for e in expenses[:8]:
+        exp_rows.append({
+            "type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
+                {"type": "text", "text": str(getattr(e, "title", ""))[:24], "size": "sm", "color": "#101828", "wrap": True, "flex": 5},
+                {"type": "text", "text": money(getattr(e, "amount", 0)), "size": "sm", "color": "#D93025", "weight": "bold", "align": "end", "flex": 2},
+            ]
+        })
+    if not exp_rows:
+        exp_rows = [{"type": "text", "text": "ยังไม่มีรายจ่ายเดือนนี้", "size": "sm", "color": "#667085"}]
+    contents = {
+        "type": "bubble",
+        "size": "giga",
+        "styles": {"body": {"backgroundColor": "#F7FAFF"}, "footer": {"backgroundColor": "#FFFFFF"}},
+        "body": {
+            "type": "box", "layout": "vertical", "paddingAll": "0px", "contents": [
+                {"type": "box", "layout": "vertical", "paddingAll": "22px", "backgroundColor": "#1649B8", "contents": [
+                    {"type": "text", "text": "📊 สรุปเงินกองสำนักงาน", "weight": "bold", "size": "xl", "color": "#FFFFFF"},
+                    {"type": "text", "text": r.title, "size": "sm", "color": "#DBEAFE", "margin": "xs"},
+                    {"type": "text", "text": f"คงเหลือ ฿ {money(s['balance'])}", "size": "xxl", "weight": "bold", "color": "#FFFFFF", "margin": "lg"},
+                ]},
+                {"type": "box", "layout": "vertical", "paddingAll": "18px", "spacing": "md", "contents": [
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "รายรับรวม", "size": "sm", "color": "#667085", "flex": 3},
+                        {"type": "text", "text": f"฿ {money(s['total_income'])}", "size": "md", "weight": "bold", "align": "end", "color": "#159947", "flex": 3},
+                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "รายจ่ายรวม", "size": "sm", "color": "#667085", "flex": 3},
+                        {"type": "text", "text": f"฿ {money(s['total_expense'])}", "size": "md", "weight": "bold", "align": "end", "color": "#D93025", "flex": 3},
+                    ]},
+                    {"type": "separator", "color": "#E6EAF2"},
+                    {"type": "text", "text": "รายจ่ายล่าสุด", "size": "md", "weight": "bold", "color": "#101828"},
+                ] + exp_rows}
+            ]
+        },
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "16px", "contents": [
+            {"type": "button", "style": "primary", "color": "#16A34A", "height": "sm", "action": {"type": "uri", "label": "ดาวน์โหลด Excel ตามฟอร์ม", "uri": f"{base_url()}/report.xlsx"}},
+            {"type": "button", "style": "link", "height": "sm", "action": {"type": "uri", "label": "ดู Dashboard", "uri": f"{base_url()}/report-summary"}},
+        ]}
+    }
+    return flex("สรุปเงินกองสำนักงาน", contents)
 
 
 def parse_expense_line(raw: str):
@@ -637,8 +689,11 @@ def handle_text(reply_token: str, raw: str):
             set_state(db, "line_pending_expense_id", str(e.id))
             reply(reply_token, [text(f"✅ บันทึกรายจ่ายแล้ว\n{e.title} {money(e.amount)} บาท\nส่งรูปใบเสร็จต่อจากข้อความนี้ได้เลย ระบบจะแนบเข้าเดือน {services.active_round(db).title}")])
             return
+        if low in ["สรุปรายงาน", "สรุปเงินกอง", "สรุปรายจ่าย", "ส่งสรุป", "dashboard รายงาน"]:
+            reply(reply_token, [report_summary_flex(db)])
+            return
         if low in ["รายงาน", "พิมพ์รายงาน", "ออกรายงาน", "report"]:
-            reply(reply_token, [report_links_text()])
+            reply(reply_token, [report_summary_flex(db), report_links_text()])
             return
         if low in ["ส่งหน้าเก็บเงิน", "เก็บเงิน", "รายการ", "dashboard", "แดชบอร์ด"]:
             reply(reply_token, [collection_flex(db)])
@@ -982,6 +1037,51 @@ async def cash_payment(member_id: int, signature_data: str = Form(...), db: Sess
     notify_admin_pending_slip(db, p)
     update_line_summary(db)
     return page("รอตรวจสอบเงินสด", f"<div class='card' style='text-align:center'><div style='font-size:70px'>🟡</div><h2>ส่งใบรับเงินสดแล้ว รอตรวจสอบ</h2><p>{m.name}</p><div class='num' style='color:#b76b00'>{money(p.due_amount)} บาท</div><p class='sub'>แอดมินต้องกดอนุมัติก่อน สถานะจึงจะเป็น Paid (Cash)</p><a class='btn' href='/dashboard'>กลับหน้ารายการ</a></div>")
+
+
+@app.get("/kplus-helper", response_class=HTMLResponse)
+def kplus_helper(pp: str = ""):
+    pp_safe = html.escape(pp or settings.PROMPTPAY_ID or "")
+    return page("เปิด K PLUS", f"""
+    <div class='hero'><div class='title'>เปิด K PLUS</div><div class='sub'>ถ้าเปิดจาก LINE ไม่เด้ง ให้ใช้วิธีสำรองนี้</div></div>
+    <div class='card'>
+      <div class='num green'>K PLUS</div>
+      <p class='muted'>บางเครื่อง LINE in-app browser ไม่ยอมเปิดแอป K PLUS โดยตรง ให้กดเปิดใน Safari หรือคัดลอกพร้อมเพย์ไปวางในแอป</p>
+      <div class='copybox'>พร้อมเพย์<br><b id='pp'>{pp_safe}</b></div>
+      <button class='btn' onclick="navigator.clipboard.writeText(document.getElementById('pp').innerText);showToast('คัดลอกพร้อมเพย์แล้ว')">📋 Copy PromptPay</button>
+      <button class='btn2' onclick="location.href='kplus://'">ลองเปิด K PLUS อีกครั้ง</button>
+      <button class='btn2' onclick="location.href='https://apps.apple.com/th/app/k-plus/id361170631'">เปิดหน้า App Store K PLUS</button>
+      <p class='note'>ขั้นตอนสำรอง: เปิด K PLUS เอง → สแกน QR หรือโอนพร้อมเพย์ → อัปโหลดสลิปกลับมาใน FundBot</p>
+      <div id='toast' class='toast'>คัดลอกแล้ว</div>
+    </div>
+    <script>function showToast(msg){{let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}}</script>
+    """)
+
+@app.get("/report-summary", response_class=HTMLResponse)
+def report_summary_page(db: Session = Depends(get_db)):
+    r = services.active_round(db)
+    if not r: raise HTTPException(404)
+    payments = db.query(Payment).filter(Payment.round_id == r.id).all()
+    expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date.desc(), Expense.id.desc()).all()
+    s = report_summary(r, payments, expenses)
+    rows = ''.join([f"""
+      <div class='member-row'>
+        <div class='avatar'>🧾</div>
+        <b>{html.escape(e.title)}</b>
+        <b class='red'>{money(e.amount)}</b>
+        <span class='muted'>{format_th(getattr(e,'expense_date',None),'%d/%m/%Y',default='-')}</span>
+      </div>
+    """ for e in expenses[:12]]) or "<p class='muted'>ยังไม่มีรายจ่าย</p>"
+    return page("สรุปรายงาน", f"""
+      <div class='hero'><div class='title'>📊 สรุปเงินกองสำนักงาน</div><div class='sub'>{html.escape(r.title)}</div></div>
+      <div class='stats'>
+        <div class='stat'><b>รายรับรวม</b><div class='num green'>{money(s['total_income'])}</div><div class='muted'>บาท</div></div>
+        <div class='stat'><b>รายจ่ายรวม</b><div class='num red'>{money(s['total_expense'])}</div><div class='muted'>{s['expense_count']} รายการ</div></div>
+        <div class='stat'><b>คงเหลือ</b><div class='num'>{money(s['balance'])}</div><div class='muted'>บาท</div></div>
+      </div>
+      <div class='card'><h2>รายจ่ายล่าสุด</h2>{rows}</div>
+      <div class='card'><h2>ไฟล์สำหรับพิมพ์</h2><a class='btn' href='/report.xlsx'>ดาวน์โหลด Excel ตามฟอร์ม</a><a class='btn2' href='/report.docx'>Word</a><a class='btn2' href='/report.pdf'>PDF</a></div>
+    """)
 
 @app.get("/report.xlsx")
 def report_xlsx(db: Session = Depends(get_db)):
