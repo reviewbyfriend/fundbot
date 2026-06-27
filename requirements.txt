@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10
+python-multipart==0.0.20
+requests==2.32.3
+qrcode[pil]==8.0
+Pillow==11.0.0
+openpyxl==3.1.5
+python-dotenv==1.0.1
