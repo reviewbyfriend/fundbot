@@ -1,58 +1,37 @@
-import base64, hashlib, hmac, requests
+import requests
 from .config import settings
 
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message"
-LINE_PROFILE_URL = "https://api.line.me/v2/bot/profile"
+LINE_API = "https://api.line.me/v2/bot/message"
+DATA_API = "https://api-data.line.me/v2/bot/message"
 
-def verify_signature(body: bytes, signature: str | None) -> bool:
-    if not settings.line_channel_secret:
-        return True
-    digest = hmac.new(settings.line_channel_secret.encode(), body, hashlib.sha256).digest()
-    expected = base64.b64encode(digest).decode()
-    return hmac.compare_digest(expected, signature or "")
+def _headers():
+    return {"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
 
-def headers(binary: bool = False):
-    h = {"Authorization": f"Bearer {settings.line_channel_access_token}"}
-    if not binary:
-        h["Content-Type"] = "application/json"
-    return h
-
-def reply(reply_token: str, messages: dict | list[dict]):
-    if isinstance(messages, dict):
-        messages = [messages]
-    if not settings.line_channel_access_token:
-        print("LINE_REPLY", messages)
+def reply(reply_token: str, messages: list[dict]):
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
         return
-    r = requests.post(LINE_REPLY_URL, headers=headers(), json={"replyToken": reply_token, "messages": messages}, timeout=15)
-    if r.status_code >= 300:
-        print("LINE reply error", r.status_code, r.text)
+    requests.post(f"{LINE_API}/reply", headers=_headers(), json={"replyToken": reply_token, "messages": messages[:5]}, timeout=8)
 
-def push(to: str, messages: dict | list[dict]):
-    if isinstance(messages, dict):
-        messages = [messages]
-    if not settings.line_channel_access_token:
-        print("LINE_PUSH", to, messages)
+def push(to: str, messages: list[dict]):
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
         return
-    r = requests.post(LINE_PUSH_URL, headers=headers(), json={"to": to, "messages": messages}, timeout=15)
-    if r.status_code >= 300:
-        print("LINE push error", r.status_code, r.text)
+    requests.post(f"{LINE_API}/push", headers=_headers(), json={"to": to, "messages": messages[:5]}, timeout=8)
 
-def text_message(text: str) -> dict:
-    return {"type": "text", "text": text[:4900]}
+def text(msg: str) -> dict:
+    return {"type": "text", "text": msg[:4900]}
 
-def image_message(url: str) -> dict:
-    return {"type": "image", "originalContentUrl": url, "previewImageUrl": url}
+def quick_reply_text(msg: str, items: list[tuple[str, str]]) -> dict:
+    return {"type": "text", "text": msg[:4900], "quickReply": {"items": [
+        {"type": "action", "action": {"type": "message", "label": label[:20], "text": txt[:300]}} for label, txt in items[:13]
+    ]}}
 
-def download_content(message_id: str) -> bytes:
-    url = f"{LINE_CONTENT_URL}/{message_id}/content"
-    r = requests.get(url, headers=headers(binary=True), timeout=30)
-    r.raise_for_status()
-    return r.content
+def image_url(original_url: str, preview_url: str | None = None) -> dict:
+    return {"type": "image", "originalContentUrl": original_url, "previewImageUrl": preview_url or original_url}
 
-def get_profile(user_id: str) -> dict:
-    if not settings.line_channel_access_token:
-        return {}
-    r = requests.get(f"{LINE_PROFILE_URL}/{user_id}", headers=headers(binary=True), timeout=15)
-    return r.json() if r.ok else {}
+def get_message_content(message_id: str) -> bytes | None:
+    if not settings.LINE_CHANNEL_ACCESS_TOKEN:
+        return None
+    r = requests.get(f"{DATA_API}/{message_id}/content", headers={"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=15)
+    if r.ok:
+        return r.content
+    return None

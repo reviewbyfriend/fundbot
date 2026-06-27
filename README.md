@@ -1,53 +1,61 @@
-# FundBot v1.0 Production
+# FundBot Group UI
 
-LINE Group Bot สำหรับเก็บเงินกองกลางรายเดือน ยอดสมาชิกไม่เท่ากัน มี PromptPay QR, OCR สลิปเบื้องต้น, สรุป/ทวง/รายงาน Excel และ deploy บน Railway ได้ทันที
+บอท LINE กลุ่มสำหรับเก็บเงินกองกลางรายเดือน แบบใช้งานง่าย มีหน้า Admin UI และคำสั่งใน LINE
 
-## Railway Variables ที่ต้องมี
+## ใช้กับ Railway
 
-```env
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-LINE_CHANNEL_SECRET=...
-LINE_CHANNEL_ACCESS_TOKEN=...
-PROMPTPAY_ID=เบอร์พร้อมเพย์หรือเลขบัตรประชาชน
-APP_BASE_URL=https://xxx.up.railway.app
-OFFICE_NAME=สำนักงานอัยการพิเศษฝ่ายคดีล้มละลาย ๑
-FUND_NAME=เงินกองกลางสำนักงาน
-OCR_SPACE_API_KEY=เว้นว่างก่อนได้
-SLIP_RECEIVER_KEYWORDS=ชื่อบัญชีรับเงิน เช่น พรสรวง,กองกลาง
-ADMIN_USER_IDS=เว้นว่างช่วงทดสอบได้
-```
-
-## Webhook URL
-
-ใส่ใน LINE Developers:
+Variables ที่ต้องมีใน Railway → web → Variables
 
 ```text
-https://xxx.up.railway.app/webhook
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+LINE_CHANNEL_SECRET=จาก LINE Developers
+LINE_CHANNEL_ACCESS_TOKEN=จาก LINE Developers
+PROMPTPAY_ID=เบอร์/เลขพร้อมเพย์ที่รับเงิน
+ADMIN_TOKEN=ตั้งรหัสเอง เช่น friend1234
+PUBLIC_BASE_URL=https://web-production-1b96.up.railway.app
 ```
 
-เปิด Use webhook = ON
+Webhook URL ใน LINE Developers:
+
+```text
+https://web-production-1b96.up.railway.app/webhook
+```
+
+Admin UI:
+
+```text
+https://web-production-1b96.up.railway.app/admin?token=รหัสที่ตั้งใน ADMIN_TOKEN
+```
 
 ## คำสั่งใน LINE กลุ่ม
 
 ```text
-ช่วยเหลือ
+เมนู
 เพิ่มสมาชิก รักษิน 500
-รายชื่อ
 เปิดรอบ กรกฎาคม 2569 ยกมา 17813.50
 ลงทะเบียน รักษิน
-ยอดของฉัน
+สถานะ
 ชำระเงิน
 จ่ายแล้ว 500
-รับเงิน รักษิน 500
-รายจ่าย ค่าน้ำ 1816
+รายจ่าย ค่าน้ำ 350
 สรุป
+ใครยังไม่จ่าย
 ทวงเงิน
 รายงาน
 ```
 
-## หมายเหตุ OCR
+## วิธีใช้งานจริงเร็วสุด
 
-- ถ้าใส่ `OCR_SPACE_API_KEY` ระบบจะพยายามอ่านยอดจากรูปสลิป
-- ถ้าอ่านได้และผู้ส่งลงทะเบียนชื่อไว้แล้ว ระบบจะบันทึกจ่ายอัตโนมัติ
-- ถ้า OCR อ่านไม่ได้ ให้พิมพ์ `จ่ายแล้ว 500` เป็น fallback
-- ระบบกันเลขอ้างอิงซ้ำแบบเบื้องต้นจากข้อความ OCR/รหัสรูป
+1. อัปไฟล์ทั้งหมดขึ้น GitHub ทับ repo เดิม
+2. Railway จะ deploy อัตโนมัติ
+3. ตั้ง Variables ให้ครบ
+4. ใส่ Webhook URL ใน LINE Developers
+5. ลากบอทเข้า LINE กลุ่ม
+6. พิมพ์ `เมนู`
+
+## หมายเหตุ
+
+เวอร์ชันนี้เน้นใช้ได้จริงด่วน:
+- มี QR PromptPay ให้สแกน
+- รับรูปสลิปได้ แต่ยังให้พิมพ์ `จ่ายแล้ว 500` เพื่อยืนยันยอด
+- OCR สลิปอัตโนมัติ 100% จะเพิ่มในเวอร์ชันถัดไป

@@ -1,28 +1,15 @@
-from pydantic import Field
-from pydantic_settings import BaseSettings
+import os
+from dotenv import load_dotenv
 
-class Settings(BaseSettings):
-    app_base_url: str = Field(default="http://localhost:8000", alias="APP_BASE_URL")
-    database_url: str = Field(default="sqlite:///./fundbot.db", alias="DATABASE_URL")
-    line_channel_access_token: str = Field(default="", alias="LINE_CHANNEL_ACCESS_TOKEN")
-    line_channel_secret: str = Field(default="", alias="LINE_CHANNEL_SECRET")
-    promptpay_id: str = Field(default="", alias="PROMPTPAY_ID")
-    admin_user_ids: str = Field(default="", alias="ADMIN_USER_IDS")
-    office_name: str = Field(default="สำนักงาน", alias="OFFICE_NAME")
-    fund_name: str = Field(default="เงินกองกลาง", alias="FUND_NAME")
-    ocr_space_api_key: str = Field(default="", alias="OCR_SPACE_API_KEY")
-    slip_receiver_keywords: str = Field(default="", alias="SLIP_RECEIVER_KEYWORDS")
+load_dotenv()
 
-    @property
-    def admin_ids(self) -> set[str]:
-        return {x.strip() for x in self.admin_user_ids.split(",") if x.strip()}
-
-    @property
-    def receiver_keywords(self) -> list[str]:
-        return [x.strip() for x in self.slip_receiver_keywords.split(",") if x.strip()]
-
-    class Config:
-        env_file = ".env"
-        populate_by_name = True
+class Settings:
+    LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+    LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./fundbot.db")
+    PROMPTPAY_ID = os.getenv("PROMPTPAY_ID", "")
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
+    BOT_NAME = os.getenv("BOT_NAME", "กองกลางบอท")
+    PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 settings = Settings()

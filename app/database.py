@@ -1,21 +1,12 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 from .config import settings
 
-url = settings.database_url
-if url.startswith("postgres://"):
-    url = url.replace("postgres://", "postgresql://", 1)
-
+url = settings.DATABASE_URL
 connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
 engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-class Base(DeclarativeBase):
-    pass
-
-def init_db():
-    from .models import Base as ModelsBase
-    ModelsBase.metadata.create_all(bind=engine)
+Base = declarative_base()
 
 def get_db():
     db = SessionLocal()
@@ -23,3 +14,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def init_db():
+    from . import models  # noqa
+    Base.metadata.create_all(bind=engine)
