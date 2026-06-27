@@ -246,8 +246,16 @@ def save_line_target(db: Session, event: dict):
         set_state(db, "line_last_user_id", source.get("userId"))
 
 
-def update_line_summary(db: Session):
-    """LINE messages cannot be edited after sending, so push a fresh updated card."""
+def update_line_summary(db: Session, force: bool = False):
+    """Do not spam LINE group on every status change.
+
+    LINE cannot edit an old Flex message after it is sent. FundBot therefore keeps
+    the original collection card as a link to the live Dashboard, and only sends
+    a fresh group summary when an admin explicitly asks or a scheduled 16:00
+    summary job calls this function with force=True.
+    """
+    if not force:
+        return
     target = get_state(db, "line_group_target_id") or get_state(db, "line_target_id")
     if target:
         push(target, [collection_flex(db)])
@@ -330,6 +338,19 @@ def evidence_file_exists(payment: Payment) -> bool:
     return bool(p and p.exists() and p.is_file())
 
 
+def evidence_sig(payment_id: int) -> str:
+    secret = settings.ADMIN_TOKEN or settings.LINE_CHANNEL_SECRET or "fundbot"
+    return hmac.new(secret.encode("utf-8"), f"evidence:{payment_id}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def signed_evidence_url(payment_id: int) -> str:
+    return f"{base_url()}/evidence/{payment_id}?sig={evidence_sig(payment_id)}"
+
+
+def verify_evidence_sig(payment_id: int, sig: str | None) -> bool:
+    return bool(sig and hmac.compare_digest(sig, evidence_sig(payment_id)))
+
+
 def notify_admin_pending_slip(db: Session, payment: Payment):
     """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
     targets = admin_notify_targets(db)
@@ -337,7 +358,7 @@ def notify_admin_pending_slip(db: Session, payment: Payment):
         return
     # ไม่ส่ง token ใน URL เพื่อให้แต่ละแอดมิน login ด้วย Admin Code ของตัวเอง
     # จะได้บันทึกได้ว่าใครเป็นคนอนุมัติ/ปฏิเสธ
-    slip_url = f"{base_url()}/admin/evidence/{payment.id}" if evidence_file_exists(payment) else ""
+    slip_url = signed_evidence_url(payment.id) if evidence_file_exists(payment) else ""
     approve_url = f"{base_url()}/admin/approve/{payment.id}"
     reject_url = f"{base_url()}/admin/reject/{payment.id}"
     view_url = f"{base_url()}/admin#pending"
@@ -703,10 +724,13 @@ def handle_text(reply_token: str, raw: str, source: dict | None = None):
         s = raw.strip()
         low = s.lower()
 
-        # ในกลุ่มให้บอททำงานเฉพาะข้อความที่ขึ้นต้นด้วย @fundbot กันตอบมั่วตอนคนคุยกัน
+        # ในกลุ่มให้บอททำงานเฉพาะข้อความที่ mention บอท กันตอบมั่วตอนคนคุยกัน
+        # รองรับชื่อจริงของ OA: @fundbkc1 และ alias เก่า: @fundbot
         is_group_chat = source_type in ["group", "room"]
-        is_mentioned = low.startswith("@fundbot")
-        command = s[len("@fundbot"):].strip() if is_mentioned else s
+        bot_triggers = ("@fundbkc1", "@fundbot")
+        matched_trigger = next((t for t in bot_triggers if low.startswith(t)), "")
+        is_mentioned = bool(matched_trigger)
+        command = s[len(matched_trigger):].strip() if is_mentioned else s
         cmd_low = command.lower().strip()
         line_admin = line_admin_for_user(db, user_id)
         line_role = getattr(line_admin, "role", None) if line_admin else None
@@ -1103,7 +1127,7 @@ async def upload_slip(member_id: int, slip: UploadFile = File(...), db: Session 
     p.note = f"transfer_slip:{out}\nรอแอดมินตรวจสอบ"
     p.status = "pending"
     p.paid_amount = Decimal("0")
-    p.paid_at = None
+    p.paid_at = datetime.utcnow()  # submitted_at while pending
     db.commit()
     db.refresh(p)
     notify_admin_pending_slip(db, p)
@@ -1131,7 +1155,7 @@ async def cash_payment(member_id: int, signature_data: str = Form(...), db: Sess
     p.rejection_reason = None
     p.status = "pending"
     p.paid_amount = Decimal("0")
-    p.paid_at = None
+    p.paid_at = datetime.utcnow()  # submitted_at while pending
     p.note = f"cash_receipt:{out}\nรอแอดมินตรวจสอบ"
     db.commit()
     db.refresh(p)
@@ -1274,6 +1298,21 @@ def admin_expense_receipt(expense_id: int, request: Request, token: str = "", db
     path = Path(e.receipt_path)
     if not path.exists() or not path.is_file():
         raise HTTPException(404, detail="ไม่พบไฟล์ใบเสร็จ อาจเกิดจากยังไม่ได้ผูก Railway Volume")
+    suffix = path.suffix.lower()
+    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/evidence/{payment_id}")
+def public_signed_evidence(payment_id: int, sig: str = "", db: Session = Depends(get_db)):
+    if not verify_evidence_sig(payment_id, sig):
+        raise HTTPException(403, detail="Forbidden")
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    path = evidence_file_path(p)
+    if not path or not path.exists() or not path.is_file():
+        raise HTTPException(404, detail="ไม่พบไฟล์หลักฐาน อาจเกิดจากการ redeploy/restart โดยยังไม่ได้ผูก Railway Volume")
     suffix = path.suffix.lower()
     media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
     return FileResponse(path, media_type=media_type, filename=path.name)
