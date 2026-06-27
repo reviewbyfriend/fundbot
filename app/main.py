@@ -270,30 +270,94 @@ def verify_slip_amount(image_path: Path, expected: Decimal) -> tuple[str, str, D
 def collection_flex(db: Session):
     r = services.active_round(db)
     pays = services.get_payments(db, r) if r else []
+    total = sum([Decimal(p.due_amount or 0) for p in pays], Decimal("0"))
+    paid_total = sum([Decimal(p.due_amount or 0) for p in pays if p.status == "paid"], Decimal("0"))
+    waiting_count = len([p for p in pays if p.status == "pending"])
+    unpaid_count = len([p for p in pays if p.status not in ["paid", "pending"]])
     rows = []
     for p in pays:
         paid = p.status == "paid"
         pending = p.status == "pending"
         paid_cash = paid and getattr(p, "payment_type", "") == "cash"
+        badge_bg = "#E8F7EE" if paid else ("#FFF4D8" if pending else "#FDE8E8")
+        badge_color = "#148F4B" if paid else ("#B76B00" if pending else "#D93025")
+        badge_text = ("จ่ายแล้ว เงินสด" if paid_cash else "จ่ายแล้ว โอน") if paid else ("รอตรวจ" if pending else "ยังไม่จ่าย")
+        name_color = "#148F4B" if paid else "#C4212A"
         rows.append({
-            "type": "box", "layout": "horizontal", "spacing": "sm", "paddingAll": "8px",
+            "type": "box",
+            "layout": "horizontal",
+            "paddingTop": "8px",
+            "paddingBottom": "8px",
+            "spacing": "sm",
             "contents": [
-                {"type": "text", "text": p.member.name, "size": "sm", "weight": "bold", "flex": 4, "wrap": True, "color": "#101828"},
-                {"type": "text", "text": money(p.due_amount), "size": "sm", "align": "end", "flex": 3, "color": "#101828"},
-                {"type": "box", "layout": "vertical", "cornerRadius": "14px", "backgroundColor": "#E8F7EE" if paid else ("#FFF7E6" if pending else "#FDECEC"), "paddingAll": "6px", "flex": 4,
-                 "contents": [{"type": "text", "text": ("✅ เงินสด" if paid_cash else "✅ โอน") if paid else ("🟡 รอตรวจ" if pending else "🔴 ยังไม่จ่าย"), "size": "xs", "align": "center", "weight": "bold", "color": "#148F4B" if paid else ("#B76B00" if pending else "#D93025")}]},
+                {"type": "text", "text": "@", "size": "md", "weight": "bold", "color": name_color, "flex": 0},
+                {"type": "text", "text": p.member.name, "size": "md", "weight": "bold", "wrap": True, "color": name_color, "flex": 4},
+                {"type": "text", "text": money(p.due_amount), "size": "md", "align": "end", "weight": "bold", "color": "#101828", "flex": 3},
+            ]
+        })
+        rows.append({
+            "type": "box",
+            "layout": "horizontal",
+            "paddingBottom": "8px",
+            "contents": [
+                {"type": "filler", "flex": 1},
+                {"type": "box", "layout": "vertical", "cornerRadius": "999px", "backgroundColor": badge_bg, "paddingTop": "5px", "paddingBottom": "5px", "paddingStart": "12px", "paddingEnd": "12px", "contents": [
+                    {"type": "text", "text": ("🟢 " if paid else ("🟡 " if pending else "🔴 ")) + badge_text, "size": "xs", "weight": "bold", "color": badge_color, "align": "center"}
+                ], "flex": 0}
             ]
         })
         rows.append({"type": "separator", "color": "#EEF2F6"})
-    body = [
-        {"type": "text", "text": "รายการสมาชิก", "weight": "bold", "size": "xl", "color": "#101828"},
-        {"type": "text", "text": f"เงินกองสำนักงาน • {r.title if r else '-'}", "size": "sm", "color": "#667085", "margin": "sm"},
-        {"type": "separator", "margin": "md", "color": "#E4E7EC"},
-    ] + rows + [
-        {"type": "button", "style": "primary", "color": "#16A34A", "margin": "lg", "height": "sm", "action": {"type": "uri", "label": "ชำระเงิน", "uri": f"{base_url()}/pay"}},
-        {"type": "button", "style": "link", "height": "sm", "action": {"type": "uri", "label": "เปิด Dashboard", "uri": f"{base_url()}/dashboard"}},
-    ]
-    return flex("เงินกองสำนักงาน", {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "contents": body}})
+
+    contents = {
+        "type": "bubble",
+        "size": "giga",
+        "styles": {"body": {"backgroundColor": "#F7FEFC"}, "footer": {"backgroundColor": "#FFFFFF"}},
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "0px",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "paddingAll": "22px",
+                    "backgroundColor": "#82DED8",
+                    "contents": [
+                        {"type": "box", "layout": "horizontal", "contents": [
+                            {"type": "box", "layout": "vertical", "contents": [
+                                {"type": "text", "text": "FundBot มาแล้ว ✨", "size": "xl", "weight": "bold", "color": "#FFFFFF"},
+                                {"type": "text", "text": f"เงินกองสำนักงาน • {r.title if r else '-'}", "size": "sm", "color": "#EFFFFE", "margin": "xs", "wrap": True},
+                            ], "flex": 5},
+                            {"type": "text", "text": "🐦", "size": "4xl", "align": "end", "flex": 1}
+                        ]},
+                        {"type": "text", "text": f"฿ {money(total)}", "size": "xxl", "weight": "bold", "color": "#FFFFFF", "margin": "lg"},
+                        {"type": "text", "text": f"เก็บแล้ว {money(paid_total)} บาท • รอตรวจ {waiting_count} • ยังไม่จ่าย {unpaid_count}", "size": "sm", "color": "#EFFFFE", "margin": "xs", "wrap": True},
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "paddingAll": "18px",
+                    "backgroundColor": "#FFFFFF",
+                    "contents": [
+                        {"type": "text", "text": "👑 รายการสมาชิก", "size": "md", "weight": "bold", "color": "#101828"},
+                        {"type": "separator", "margin": "md", "color": "#E4E7EC"},
+                    ] + rows
+                }
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "paddingAll": "16px",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#16A34A", "height": "sm", "action": {"type": "uri", "label": "ชำระเงิน", "uri": f"{base_url()}/pay"}},
+                {"type": "button", "style": "link", "height": "sm", "action": {"type": "uri", "label": "ดูว่าใครจ่ายแล้ว", "uri": f"{base_url()}/dashboard"}},
+            ]
+        }
+    }
+    return flex("เงินกองสำนักงาน", contents)
 
 def menu_text():
     return text("FundBot ใช้งานหลัก:\n• ส่งหน้าเก็บเงิน\n• ชำระเงิน\n• สรุป")
@@ -518,7 +582,7 @@ def pay_member(member_id: int, db: Session = Depends(get_db)):
         <button type='button' onclick='copyPP()'>📋 <b>Copy PromptPay</b><br><span class='note'>คัดลอกเลขพร้อมเพย์</span></button>
         <button class='bankbtn ktb' type='button' onclick='openSchemes(["ktbnext://","krungthai-next://","next://"])'>🔵 <b>Open Krungthai NEXT</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
         <button class='bankbtn scb' type='button' onclick='openSchemes(["scbeasy://","scbeasyapp://"])'>🟣 <b>Open SCB EASY</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
-        <button class='bankbtn kplus' type='button' onclick='openSchemes(["kplus://","kbank-kplus://"])'>🟢 <b>Open K PLUS</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
+        <button class='bankbtn kplus' type='button' onclick='openKPlus()'>🟢 <b>Open K PLUS</b><br><span class='note'>ถ้าเปิดไม่ได้ ระบบจะนิ่งไว้</span></button>
       </div>
       <div id='toast' class='toast'>คัดลอกพร้อมเพย์แล้ว</div>
     </div>
