@@ -413,13 +413,13 @@ def receipt_html(payment: Payment, *, line_links: dict | None = None) -> str:
       .sign-name{{border-top:1px dashed #86b592;margin:12px 20px 0;padding-top:8px;color:#475467}}
       .missing-evidence{{min-height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#667085;background:#f8fafc;border-radius:12px;margin-top:12px}}
       .receipt-footer{{margin-top:18px;border-radius:18px;background:#f3f8f4;padding:14px;display:flex;justify-content:space-between;gap:16px;align-items:center;color:#215b35}}
-      .receipt-actions{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}} .receipt-action{{text-decoration:none;text-align:center;border-radius:18px;padding:16px 18px;font-size:18px;font-weight:950}} .receipt-action.ok{{background:#16a34a;color:white}} .receipt-action.bad{{background:#fee2e2;color:#dc2626}}
+      .receipt-actions{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}} .receipt-action{{text-decoration:none;text-align:center;border:0;border-radius:18px;padding:16px 18px;font-size:18px;font-weight:950;cursor:pointer}} .receipt-action.ok{{background:#16a34a;color:white}} .receipt-action.bad{{background:#fee2e2;color:#dc2626}} .receipt-action.blue{{background:#155EEF;color:white}} .receipt-action.gray{{background:#667085;color:white}} .receipt-action.light{{background:#F2F4F7;color:#344054}}
       @media(max-width:720px){{.receipt-paper{{padding:16px;border-radius:22px}}.receipt-title{{font-size:32px}}.receipt-head,.receipt-grid,.amount-box,.sign-grid{{grid-template-columns:1fr;display:grid}}.receipt-meta{{text-align:left}}.amount-left{{border-right:0;border-bottom:1px dashed #86b592}}.receipt-actions{{grid-template-columns:1fr}}}}
     </style>
     <div class='receipt-wrap'>
       <div class='receipt-paper'>
         <div class='receipt-head'>
-          <div class='receipt-brand'><div class='receipt-icon'>฿</div><div><div class='receipt-title'>{title}</div><div class='receipt-sub'>กองทุนสำนักงานเขต</div></div></div>
+          <div class='receipt-brand'><div class='receipt-icon'>฿</div><div><div class='receipt-title'>{title}</div></div></div>
           <div class='receipt-meta'><b>เลขที่ใบเสร็จ:</b> {receipt_number(payment)}<br><b>วันที่ออกใบเสร็จ:</b> {date_txt}<br><b>เวลา:</b> {time_txt} น.</div>
         </div>
         <div class='receipt-status'>✅ {hero_status}</div>
@@ -436,10 +436,33 @@ def receipt_html(payment: Payment, *, line_links: dict | None = None) -> str:
           <div class='sign-box'><span class='sign-label'>ผู้ชำระเงิน</span>{img_block}<div class='sign-name'>( {member} )<br>วันที่ {date_txt} เวลา {time_txt} น.</div></div>
           <div class='sign-box'><span class='sign-label'>ผู้รับเงิน</span><div style='font-size:48px;margin:28px 0 8px'>👩🏻‍💼</div><div class='sign-name'>( {receiver} )<br>{'รออนุมัติ' if payment.status != 'paid' else 'อนุมัติแล้ว'}</div></div>
         </div></div>
-        <div class='receipt-footer'><div>🛡️ ขอบคุณที่ร่วมเป็นส่วนหนึ่งในการสนับสนุนพวกเรา<br><b>FundBot System</b></div><div style='font-size:44px'>▦</div></div>
-        <div class='receipt-actions'>{approve_btn}{reject_btn}</div>
+        <div class='receipt-footer'><div>🛡️ ขอบคุณที่ร่วมเป็นส่วนหนึ่งในการสนับสนุนพวกเรา<br><b>สแกนตรวจสอบใบเสร็จ</b></div><div style='font-size:44px'>▦</div></div>
+        <div class='receipt-actions'>
+          {approve_btn}{reject_btn}
+          <button class='receipt-action ok' onclick='saveReceiptImage()'>⬇️ บันทึกเป็นรูป</button>
+          <button class='receipt-action blue' onclick='shareReceipt()'>🔗 แชร์ใบเสร็จ</button>
+          <button class='receipt-action gray' onclick='window.print()'>🖨️ พิมพ์</button>
+          <button class='receipt-action light' onclick='history.length>1?history.back():window.close()'>× ปิด</button>
+        </div>
       </div>
     </div>
+    <script src='https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'></script>
+    <script>
+      async function saveReceiptImage(){{
+        const node=document.querySelector('.receipt-paper');
+        if(!window.html2canvas){{ alert('ถ้าโหลดระบบบันทึกรูปไม่ได้ ให้กดแชร์หรือแคปหน้าจอแทน'); return; }}
+        const canvas=await html2canvas(node,{{scale:2,backgroundColor:'#ffffff',useCORS:true}});
+        canvas.toBlob(async (blob)=>{{
+          const file=new File([blob],'fundbot-receipt-{receipt_number(payment)}.png',{{type:'image/png'}});
+          if(navigator.canShare && navigator.canShare({{files:[file]}})){{ await navigator.share({{files:[file],title:'ใบเสร็จรับเงิน FundBot'}}); return; }}
+          const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=file.name; a.click();
+        }});
+      }}
+      async function shareReceipt(){{
+        if(navigator.share){{ await navigator.share({{title:'ใบเสร็จรับเงิน FundBot',url:location.href}}); }}
+        else {{ navigator.clipboard.writeText(location.href); alert('คัดลอกลิงก์ใบเสร็จแล้ว'); }}
+      }}
+    </script>
     """
 
 
@@ -491,6 +514,26 @@ def line_admins_for_notify(db: Session) -> list[AdminUser]:
         AdminUser.line_user_id.isnot(None),
         AdminUser.role.in_(["owner", "approver"]),
     ).order_by(AdminUser.id).all()
+
+
+
+def report_action_sig(exp: int) -> str:
+    secret = settings.ADMIN_TOKEN or settings.LINE_CHANNEL_SECRET or "fundbot-report-action"
+    return hmac.new(secret.encode("utf-8"), f"report:{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def report_action_url() -> str:
+    exp = int(time.time()) + 86400
+    sig = report_action_sig(exp)
+    return f"{base_url()}/line-admin/send-report-to-group?exp={exp}&sig={sig}"
+
+
+def verify_report_action(exp: int | None, sig: str | None) -> bool:
+    if not exp or not sig:
+        return False
+    if int(exp) < int(time.time()):
+        return False
+    return hmac.compare_digest(report_action_sig(int(exp)), sig)
 
 
 def notify_admin_pending_slip(db: Session, payment: Payment):
@@ -706,61 +749,65 @@ def report_links_text():
         "📄 ออกรายงานเงินกอง\n"
         f"Excel: {base_url()}/report.xlsx\n"
         f"Word: {base_url()}/report.docx\n"
-        f"PDF: {base_url()}/report.pdf\n\n"
+        f"PDF: {base_url()}/report.pdf\n"
+        f"Dashboard: {base_url()}/report-summary\n\n"
         "ไฟล์ Excel จะใช้แม่แบบเดิม เปลี่ยนเฉพาะตัวเลข/ข้อมูลด้านในค่ะ"
     )
 
 
 
 
-def report_summary_flex(db: Session):
+def report_summary_flex(db: Session, include_send_button: bool = True):
     r = services.active_round(db)
     if not r:
         return text("ยังไม่มีรอบรายงาน")
     payments = db.query(Payment).filter(Payment.round_id == r.id).all()
     expenses = db.query(Expense).filter(Expense.round_id == r.id).order_by(Expense.expense_date, Expense.id).all()
     s = report_summary(r, payments, expenses)
-    exp_rows = []
-    for e in expenses[:8]:
-        exp_rows.append({
-            "type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
-                {"type": "text", "text": str(getattr(e, "title", ""))[:24], "size": "sm", "color": "#101828", "wrap": True, "flex": 5},
-                {"type": "text", "text": money(getattr(e, "amount", 0)), "size": "sm", "color": "#D93025", "weight": "bold", "align": "end", "flex": 2},
+    month_name = r.title or "เดือนนี้"
+    exp_count = int(s.get('expense_count') or len(expenses))
+    total_expense = money(s.get('total_expense') or 0)
+    total_income = money(s.get('total_income') or 0)
+    balance = money(s.get('balance') or 0)
+    latest = []
+    for e in expenses[:5]:
+        latest.append({
+            "type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":str(getattr(e,'title',''))[:26],"size":"sm","color":"#344054","wrap":True,"flex":5},
+                {"type":"text","text":money(getattr(e,'amount',0)),"size":"sm","color":"#D92D20","weight":"bold","align":"end","flex":2},
             ]
         })
-    if not exp_rows:
-        exp_rows = [{"type": "text", "text": "ยังไม่มีรายจ่ายเดือนนี้", "size": "sm", "color": "#667085"}]
+    if not latest:
+        latest = [{"type":"text","text":"ยังไม่มีรายจ่ายเดือนนี้","size":"sm","color":"#667085"}]
+    buttons = [
+        {"type":"button","style":"primary","color":"#16A34A","height":"sm","action":{"type":"uri","label":"📄 PDF","uri":f"{base_url()}/report.pdf"}},
+        {"type":"button","style":"secondary","height":"sm","action":{"type":"uri","label":"📊 Excel","uri":f"{base_url()}/report.xlsx"}},
+        {"type":"button","style":"secondary","height":"sm","action":{"type":"uri","label":"📈 Dashboard","uri":f"{base_url()}/report-summary"}},
+    ]
+    if include_send_button:
+        buttons.append({"type":"button","style":"link","height":"sm","color":"#155EEF","action":{"type":"uri","label":"📤 ส่งเข้ากลุ่ม","uri":report_action_url()}})
     contents = {
-        "type": "bubble",
-        "size": "giga",
-        "styles": {"body": {"backgroundColor": "#F7FAFF"}, "footer": {"backgroundColor": "#FFFFFF"}},
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "0px", "contents": [
-                {"type": "box", "layout": "vertical", "paddingAll": "22px", "backgroundColor": "#1649B8", "contents": [
-                    {"type": "text", "text": "📊 สรุปเงินกองสำนักงาน", "weight": "bold", "size": "xl", "color": "#FFFFFF"},
-                    {"type": "text", "text": r.title, "size": "sm", "color": "#DBEAFE", "margin": "xs"},
-                    {"type": "text", "text": f"คงเหลือ ฿ {money(s['balance'])}", "size": "xxl", "weight": "bold", "color": "#FFFFFF", "margin": "lg"},
-                ]},
-                {"type": "box", "layout": "vertical", "paddingAll": "18px", "spacing": "md", "contents": [
-                    {"type": "box", "layout": "horizontal", "contents": [
-                        {"type": "text", "text": "รายรับรวม", "size": "sm", "color": "#667085", "flex": 3},
-                        {"type": "text", "text": f"฿ {money(s['total_income'])}", "size": "md", "weight": "bold", "align": "end", "color": "#159947", "flex": 3},
-                    ]},
-                    {"type": "box", "layout": "horizontal", "contents": [
-                        {"type": "text", "text": "รายจ่ายรวม", "size": "sm", "color": "#667085", "flex": 3},
-                        {"type": "text", "text": f"฿ {money(s['total_expense'])}", "size": "md", "weight": "bold", "align": "end", "color": "#D93025", "flex": 3},
-                    ]},
-                    {"type": "separator", "color": "#E6EAF2"},
-                    {"type": "text", "text": "รายจ่ายล่าสุด", "size": "md", "weight": "bold", "color": "#101828"},
-                ] + exp_rows}
-            ]
-        },
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "16px", "contents": [
-            {"type": "button", "style": "primary", "color": "#16A34A", "height": "sm", "action": {"type": "uri", "label": "ดาวน์โหลด Excel ตามฟอร์ม", "uri": f"{base_url()}/report.xlsx"}},
-            {"type": "button", "style": "link", "height": "sm", "action": {"type": "uri", "label": "ดู Dashboard", "uri": f"{base_url()}/report-summary"}},
-        ]}
+        "type":"bubble",
+        "size":"giga",
+        "styles":{"body":{"backgroundColor":"#F8FAFC"},"footer":{"backgroundColor":"#FFFFFF"}},
+        "body":{"type":"box","layout":"vertical","paddingAll":"0px","contents":[
+            {"type":"box","layout":"vertical","paddingAll":"22px","backgroundColor":"#0F172A","contents":[
+                {"type":"text","text":f"📦 รายงาน{month_name}พร้อมแล้ว","weight":"bold","size":"xl","color":"#FFFFFF","wrap":True},
+                {"type":"text","text":"เงินกองสำนักงาน • สรุปสำหรับพิมพ์/ส่งกลุ่ม","size":"sm","color":"#CBD5E1","margin":"xs","wrap":True},
+            ]},
+            {"type":"box","layout":"vertical","paddingAll":"18px","spacing":"md","contents":[
+                {"type":"box","layout":"horizontal","contents":[{"type":"text","text":"รายรับ","size":"sm","color":"#667085","flex":3},{"type":"text","text":f"฿ {total_income}","size":"md","weight":"bold","align":"end","color":"#16A34A","flex":3}]},
+                {"type":"box","layout":"horizontal","contents":[{"type":"text","text":"ค่าใช้จ่าย","size":"sm","color":"#667085","flex":3},{"type":"text","text":f"{exp_count} รายการ","size":"md","weight":"bold","align":"end","color":"#101828","flex":3}]},
+                {"type":"box","layout":"horizontal","contents":[{"type":"text","text":"รวมรายจ่าย","size":"sm","color":"#667085","flex":3},{"type":"text","text":f"฿ {total_expense}","size":"md","weight":"bold","align":"end","color":"#D92D20","flex":3}]},
+                {"type":"separator","color":"#E4E7EC"},
+                {"type":"box","layout":"horizontal","contents":[{"type":"text","text":"คงเหลือ","size":"md","weight":"bold","color":"#101828","flex":3},{"type":"text","text":f"฿ {balance}","size":"lg","weight":"bold","align":"end","color":"#155EEF","flex":3}]},
+                {"type":"separator","color":"#E4E7EC"},
+                {"type":"text","text":"รายจ่ายล่าสุด","size":"md","weight":"bold","color":"#101828"},
+            ] + latest}
+        ]},
+        "footer":{"type":"box","layout":"vertical","spacing":"sm","paddingAll":"16px","contents":buttons}
     }
-    return flex("สรุปเงินกองสำนักงาน", contents)
+    return flex("รายงานเงินกองพร้อมแล้ว", contents)
 
 
 def parse_expense_line(raw: str):
@@ -978,7 +1025,7 @@ def handle_text(reply_token: str, raw: str, source: dict | None = None):
         if low in ["สรุปรายงาน", "สรุปเงินกอง", "สรุปรายจ่าย", "ส่งสรุป", "dashboard รายงาน"]:
             reply(reply_token, [report_summary_flex(db)])
             return
-        if low in ["รายงาน", "พิมพ์รายงาน", "ออกรายงาน", "report"]:
+        if low in ["รายงาน", "พิมพ์รายงาน", "ออกรายงาน", "report", "ส่งรายงาน", "รายงานเดือน"]:
             reply(reply_token, [report_summary_flex(db), report_links_text()])
             return
         if low in ["ส่งหน้าเก็บเงิน", "เก็บเงิน", "รายการ", "dashboard", "แดชบอร์ด"]:
@@ -1342,6 +1389,17 @@ def kplus_helper(pp: str = ""):
     </div>
     <script>function showToast(msg){{let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1600)}}</script>
     """)
+
+
+@app.get("/line-admin/send-report-to-group", response_class=HTMLResponse)
+def line_admin_send_report_to_group(exp: int | None = None, sig: str = "", db: Session = Depends(get_db)):
+    if not verify_report_action(exp, sig):
+        raise HTTPException(403, detail="ลิงก์ส่งรายงานไม่ถูกต้องหรือหมดอายุ")
+    target = get_state(db, "line_group_target_id") or get_state(db, "line_target_id")
+    if not target:
+        return page("ส่งรายงาน", "<div class='card'><h2>ยังไม่พบกลุ่ม LINE</h2><p class='muted'>ให้เชิญบอทเข้ากลุ่มแล้วพิมพ์ @fundbkc1 เรียกเก็บ หรือ @fundbkc1 สรุป ก่อนหนึ่งครั้ง เพื่อให้ระบบจำกลุ่ม</p></div>")
+    push(target, [report_summary_flex(db, include_send_button=False)])
+    return page("ส่งรายงานแล้ว", "<div class='card' style='text-align:center'><div style='font-size:64px'>✅</div><h2>ส่งรายงานเข้ากลุ่มแล้ว</h2><p class='muted'>สามารถปิดหน้านี้ได้เลย</p></div>")
 
 @app.get("/report-summary", response_class=HTMLResponse)
 def report_summary_page(db: Session = Depends(get_db)):
