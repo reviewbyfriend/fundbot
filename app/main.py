@@ -351,50 +351,106 @@ def verify_evidence_sig(payment_id: int, sig: str | None) -> bool:
     return bool(sig and hmac.compare_digest(sig, evidence_sig(payment_id)))
 
 
+def line_admin_action_secret() -> str:
+    return settings.ADMIN_TOKEN or settings.LINE_CHANNEL_SECRET or "fundbot-line-admin-secret"
+
+
+def line_admin_action_sig(action: str, payment_id: int, admin_id: int, exp: int) -> str:
+    payload = f"{action}:{payment_id}:{admin_id}:{exp}"
+    return hmac.new(line_admin_action_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def line_admin_signed_url(action: str, payment_id: int, admin: AdminUser, ttl_seconds: int = 86400) -> str:
+    exp = int(time.time()) + ttl_seconds
+    sig = line_admin_action_sig(action, payment_id, admin.id, exp)
+    return f"{base_url()}/line-admin/{action}/{payment_id}?aid={admin.id}&exp={exp}&sig={sig}"
+
+
+def verify_line_admin_action(db: Session, action: str, payment_id: int, aid: int | None, exp: int | None, sig: str | None, roles=("owner", "approver")) -> dict:
+    if not aid or not exp or not sig:
+        raise HTTPException(403, detail="ลิงก์ไม่ถูกต้อง")
+    if int(exp) < int(time.time()):
+        raise HTTPException(403, detail="ลิงก์หมดอายุแล้ว กรุณาเปิดจากการ์ดแจ้งเตือนล่าสุด")
+    expected = line_admin_action_sig(action, int(payment_id), int(aid), int(exp))
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(403, detail="ลิงก์ไม่ถูกต้อง")
+    admin = db.query(AdminUser).filter(AdminUser.id == int(aid), AdminUser.active == True).first()
+    if not admin or admin.role not in roles:
+        raise HTTPException(403, detail="บัญชีนี้ไม่มีสิทธิ์ทำรายการ")
+    return {"id": admin.id, "name": admin.name, "role": admin.role, "legacy": False, "line_user_id": admin.line_user_id}
+
+
+def line_admins_for_notify(db: Session) -> list[AdminUser]:
+    return db.query(AdminUser).filter(
+        AdminUser.active == True,
+        AdminUser.line_user_id.isnot(None),
+        AdminUser.role.in_(["owner", "approver"]),
+    ).order_by(AdminUser.id).all()
+
+
 def notify_admin_pending_slip(db: Session, payment: Payment):
-    """แจ้งแอดมินว่ามีสลิปรอตรวจ พร้อมปุ่มอนุมัติ/ไม่ผ่าน"""
-    targets = admin_notify_targets(db)
-    if not targets:
+    """ส่งการ์ดรอตรวจเฉพาะแชตส่วนตัวของแอดมินที่ลงทะเบียน LINE แล้ว.
+
+    สำคัญ: ห้ามส่งเข้ากลุ่ม เพราะเป็นงานหลังบ้านและอาจรกกลุ่ม.
+    ปุ่มอนุมัติ/ดูหลักฐานใช้ signed URL เฉพาะแอดมินคนนั้น จึงไม่ต้อง login ซ้ำในเว็บ.
+    """
+    admins = line_admins_for_notify(db)
+    # legacy fallback เฉพาะ userId ส่วนตัวเท่านั้น; ไม่ fallback ไป group/room
+    legacy = admin_notify_target(db)
+    if not admins and legacy and str(legacy).startswith("U"):
+        class _LegacyAdmin:
+            id = 0
+            name = "Legacy Admin"
+            role = "owner"
+            line_user_id = legacy
+        admins = [_LegacyAdmin()]
+    if not admins:
         return
-    # ไม่ส่ง token ใน URL เพื่อให้แต่ละแอดมิน login ด้วย Admin Code ของตัวเอง
-    # จะได้บันทึกได้ว่าใครเป็นคนอนุมัติ/ปฏิเสธ
-    slip_url = signed_evidence_url(payment.id) if evidence_file_exists(payment) else ""
-    approve_url = f"{base_url()}/admin/approve/{payment.id}"
-    reject_url = f"{base_url()}/admin/reject/{payment.id}"
-    view_url = f"{base_url()}/admin#pending"
-    contents = {
-        "type": "bubble",
-        "size": "mega",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "📥 มีสลิปรอตรวจ", "weight": "bold", "size": "xl", "color": "#101828"},
-                {"type": "separator", "color": "#E4E7EC"},
-                {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
-                    {"type": "text", "text": f"ชื่อ: {payment.member.name}", "size": "md", "weight": "bold", "wrap": True},
-                    {"type": "text", "text": f"ยอด: {money(payment.due_amount)} บาท", "size": "md", "color": "#16A34A", "weight": "bold"},
-                    {"type": "text", "text": f"ประเภท: {'เงินสด' if getattr(payment, 'payment_type', '') == 'cash' else 'โอน'}", "size": "sm", "color": "#667085"},
-                    {"type": "text", "text": f"เดือน: {payment.round.title}", "size": "sm", "color": "#667085", "wrap": True},
-                ]},
-            ]
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {"type": "button", "style": "primary", "color": "#16A34A", "action": {"type": "uri", "label": "✅ อนุมัติ", "uri": approve_url}},
-                {"type": "button", "style": "secondary", "action": {"type": "uri", "label": "🖼 ดูสลิป/หลังบ้าน", "uri": view_url}},
-                {"type": "button", "style": "link", "color": "#DC2626", "action": {"type": "uri", "label": "❌ ไม่ผ่าน", "uri": reject_url}},
-            ]
+
+    evidence_public_url = signed_evidence_url(payment.id) if evidence_file_exists(payment) else ""
+    submitted_at = format_th(getattr(payment, "paid_at", None)) if getattr(payment, "paid_at", None) else "-"
+    payment_type_label = "เงินสด" if getattr(payment, "payment_type", "") == "cash" else "โอน"
+
+    for admin in admins:
+        # Legacy id=0 cannot use per-admin signed approve. In practice it only happens before proper registration.
+        if not getattr(admin, "id", None):
+            continue
+        approve_url = line_admin_signed_url("approve", payment.id, admin)
+        reject_url = line_admin_signed_url("reject", payment.id, admin)
+        evidence_url_for_admin = line_admin_signed_url("evidence", payment.id, admin)
+        contents = {
+            "type": "bubble",
+            "size": "mega",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {"type": "text", "text": "📥 มีสลิปรอตรวจ", "weight": "bold", "size": "xl", "color": "#101828"},
+                    {"type": "separator", "color": "#E4E7EC"},
+                    {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+                        {"type": "text", "text": f"ชื่อ: {payment.member.name}", "size": "md", "weight": "bold", "wrap": True},
+                        {"type": "text", "text": f"ยอด: {money(payment.due_amount)} บาท", "size": "md", "color": "#16A34A", "weight": "bold"},
+                        {"type": "text", "text": f"ประเภท: {payment_type_label}", "size": "sm", "color": "#667085"},
+                        {"type": "text", "text": f"วันที่ส่ง: {submitted_at}", "size": "sm", "color": "#667085"},
+                        {"type": "text", "text": f"เดือน: {payment.round.title}", "size": "sm", "color": "#667085", "wrap": True},
+                    ]},
+                ]
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "button", "style": "primary", "color": "#16A34A", "action": {"type": "uri", "label": "✅ อนุมัติ", "uri": approve_url}},
+                    {"type": "button", "style": "secondary", "action": {"type": "uri", "label": "🖼 ดูสลิป/ลายเซ็น", "uri": evidence_url_for_admin}},
+                    {"type": "button", "style": "link", "color": "#DC2626", "action": {"type": "uri", "label": "❌ ไม่ผ่าน", "uri": reject_url}},
+                ]
+            }
         }
-    }
-    if slip_url:
-        contents["hero"] = {"type": "image", "url": slip_url, "size": "full", "aspectRatio": "16:10", "aspectMode": "cover"}
-    for target in targets:
-        push(target, [flex("มีสลิปรอตรวจ", contents)])
+        if evidence_public_url:
+            contents["hero"] = {"type": "image", "url": evidence_public_url, "size": "full", "aspectRatio": "16:10", "aspectMode": "cover"}
+        push(admin.line_user_id, [flex("มีสลิปรอตรวจ", contents)])
 
 def ocr_space_text(image_path: Path) -> str:
     if not settings.OCR_SPACE_API_KEY:
@@ -1317,6 +1373,86 @@ def public_signed_evidence(payment_id: int, sig: str = "", db: Session = Depends
     media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
     return FileResponse(path, media_type=media_type, filename=path.name)
 
+
+
+@app.get("/line-admin/evidence/{payment_id}")
+def line_admin_evidence(payment_id: int, aid: int | None = None, exp: int | None = None, sig: str = "", db: Session = Depends(get_db)):
+    verify_line_admin_action(db, "evidence", payment_id, aid, exp, sig, roles=("owner", "approver", "viewer"))
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    path = evidence_file_path(p)
+    if not path or not path.exists() or not path.is_file():
+        raise HTTPException(404, detail="ไม่พบไฟล์หลักฐาน อาจเกิดจากการ redeploy/restart โดยยังไม่ได้ผูก Railway Volume")
+    suffix = path.suffix.lower()
+    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/line-admin/approve/{payment_id}", response_class=HTMLResponse)
+def line_admin_approve(payment_id: int, aid: int | None = None, exp: int | None = None, sig: str = "", db: Session = Depends(get_db)):
+    admin_ctx = verify_line_admin_action(db, "approve", payment_id, aid, exp, sig, roles=("owner", "approver"))
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    if p.status == "paid":
+        return page("อนุมัติแล้ว", f"<div class='card'><h2>✅ รายการนี้อนุมัติแล้ว</h2><p>{html.escape(p.member.name)} {money(p.due_amount)} บาท</p><p class='note'>ปิดหน้านี้ได้เลย</p></div>")
+    ptype = getattr(p, "payment_type", "") or ("cash" if getattr(p, "receipt_path", None) else "transfer")
+    services.mark_member_paid(db, p.member_id, Decimal(p.due_amount or 0), note=(p.note or "") + f"\nline_admin_approved_by:{admin_ctx['name']}", slip_path=p.slip_path)
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    p.payment_type = ptype
+    p.rejection_reason = None
+    db.commit()
+    audit_admin(db, admin_ctx, "line_approve", p.id, f"{p.member.name} {money(p.due_amount)} {ptype}")
+    update_line_summary(db)
+    # แจ้งเฉพาะแอดมินส่วนตัว ไม่แจ้งเข้ากลุ่ม
+    for target in admin_notify_targets(db):
+        if str(target).startswith("U"):
+            push(target, [text(f"✅ อนุมัติแล้ว: {p.member.name} {money(p.due_amount)} บาท\nโดย: {admin_ctx['name']}")])
+    return page("อนุมัติสำเร็จ", f"<div class='card'><h2>✅ อนุมัติสำเร็จ</h2><p><b>{html.escape(p.member.name)}</b></p><p class='num green'>{money(p.due_amount)} บาท</p><p class='note'>โดย {html.escape(admin_ctx['name'])} · ปิดหน้านี้ได้เลย</p></div>")
+
+
+@app.get("/line-admin/reject/{payment_id}", response_class=HTMLResponse)
+def line_admin_reject_form(payment_id: int, aid: int | None = None, exp: int | None = None, sig: str = "", db: Session = Depends(get_db)):
+    verify_line_admin_action(db, "reject", payment_id, aid, exp, sig, roles=("owner", "approver"))
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    return page("ไม่ผ่าน", f"""
+    <div class='card'>
+      <h2>❌ ไม่ผ่าน: {html.escape(p.member.name)}</h2>
+      <p class='num red'>{money(p.due_amount)} บาท</p>
+      <form method='post' action='/line-admin/reject/{p.id}'>
+        <input type='hidden' name='aid' value='{aid or ""}'>
+        <input type='hidden' name='exp' value='{exp or ""}'>
+        <input type='hidden' name='sig' value='{html.escape(sig or "")}'>
+        <input name='reason' required placeholder='เหตุผลที่ไม่ผ่าน'>
+        <button class='btn danger'>บันทึกว่าไม่ผ่าน</button>
+      </form>
+    </div>
+    """)
+
+
+@app.post("/line-admin/reject/{payment_id}", response_class=HTMLResponse)
+def line_admin_reject(payment_id: int, aid: int = Form(...), exp: int = Form(...), sig: str = Form(...), reason: str = Form(...), db: Session = Depends(get_db)):
+    admin_ctx = verify_line_admin_action(db, "reject", payment_id, aid, exp, sig, roles=("owner", "approver"))
+    p = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not p:
+        raise HTTPException(404)
+    if p.status == "paid":
+        return page("อนุมัติแล้ว", f"<div class='card'><h2>รายการนี้ถูกอนุมัติไปแล้ว</h2><p>{html.escape(p.member.name)}</p></div>")
+    p.status = "unpaid"
+    p.paid_amount = Decimal("0")
+    p.paid_at = None
+    p.rejection_reason = reason.strip()
+    p.note = (p.note or "") + f"\nline_admin_rejected_by:{admin_ctx['name']}:{reason.strip()}"
+    db.commit()
+    audit_admin(db, admin_ctx, "line_reject", p.id, f"{p.member.name}: {reason.strip()}")
+    update_line_summary(db)
+    for target in admin_notify_targets(db):
+        if str(target).startswith("U"):
+            push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nโดย: {admin_ctx['name']}")])
+    return page("บันทึกแล้ว", f"<div class='card'><h2>❌ บันทึกว่าไม่ผ่านแล้ว</h2><p><b>{html.escape(p.member.name)}</b></p><p>เหตุผล: {html.escape(reason.strip())}</p><p class='note'>ปิดหน้านี้ได้เลย</p></div>")
 
 @app.get("/admin/evidence/{payment_id}")
 def admin_evidence(payment_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
