@@ -338,6 +338,111 @@ def evidence_file_exists(payment: Payment) -> bool:
     return bool(p and p.exists() and p.is_file())
 
 
+def evidence_data_uri(payment: Payment) -> str:
+    path = evidence_file_path(payment)
+    if not path or not path.exists() or not path.is_file():
+        return ""
+    suffix = path.suffix.lower()
+    mime = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+    try:
+        return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def payment_submitted_date(payment: Payment) -> str:
+    return format_th(getattr(payment, "paid_at", None), "%d/%m/%Y", default="-")
+
+
+def payment_submitted_time(payment: Payment) -> str:
+    return format_th(getattr(payment, "paid_at", None), "%H:%M", default="-")
+
+
+def receipt_number(payment: Payment) -> str:
+    base_dt = getattr(payment, "paid_at", None) or getattr(payment, "id", None)
+    date_part = format_th(getattr(payment, "paid_at", None), "%Y%m%d", default=now_bangkok().strftime("%Y%m%d"))
+    return f"RC{date_part}{int(payment.id or 0):04d}"
+
+
+def approval_admin_from_note(payment: Payment) -> str:
+    note = getattr(payment, "note", "") or ""
+    m = re.search(r"line_admin_approved_by:([^\n]+)", note)
+    return m.group(1).strip() if m else "ผู้ดูแลระบบ"
+
+
+def receipt_html(payment: Payment, *, line_links: dict | None = None) -> str:
+    """สวย ๆ สำหรับดูหลักฐานจาก LINE: เงินสด = ใบเสร็จ, โอน = รายละเอียดสลิป."""
+    is_cash = (getattr(payment, "payment_type", "") == "cash")
+    img = evidence_data_uri(payment)
+    member = html.escape(payment.member.name if payment.member else "-")
+    round_title = html.escape(payment.round.title if payment.round else "-")
+    ptype = "เงินสด" if is_cash else "โอน"
+    date_txt = payment_submitted_date(payment)
+    time_txt = payment_submitted_time(payment)
+    amount_txt = money(payment.due_amount)
+    status_txt = "รับเงินสดเรียบร้อยแล้ว" if is_cash and payment.status == "paid" else ("รับเงินสด รอแอดมินตรวจสอบ" if is_cash else "รับสลิปโอนเงิน รอแอดมินตรวจสอบ")
+    receiver = html.escape(approval_admin_from_note(payment) if payment.status == "paid" else "รอแอดมินอนุมัติ")
+    approve_btn = reject_btn = ""
+    if line_links:
+        approve_btn = f"<a class='receipt-action ok' href='{html.escape(line_links.get('approve',''))}'>✅ อนุมัติ</a>" if line_links.get('approve') else ""
+        reject_btn = f"<a class='receipt-action bad' href='{html.escape(line_links.get('reject',''))}'>❌ ไม่ผ่าน</a>" if line_links.get('reject') else ""
+    img_block = f"<img class='receipt-sign-img' src='{img}' alt='หลักฐาน'>" if img else "<div class='missing-evidence'>ไม่พบรูปหลักฐาน<br><small>ถ้าเพิ่ง redeploy อาจต้องผูก Railway Volume เพื่อเก็บไฟล์อัปโหลด</small></div>"
+    if not is_cash:
+        title = "หลักฐานการโอนเงิน"
+        main_label = "สลิปโอนเงิน"
+        hero_status = "รับสลิปเรียบร้อยแล้ว"
+    else:
+        title = "ใบเสร็จรับเงิน"
+        main_label = "ลายเซ็นผู้ชำระเงิน"
+        hero_status = status_txt
+    return f"""
+    <style>
+      body{{background:#eef8f1!important}} .receipt-wrap{{max-width:860px;margin:0 auto}}
+      .receipt-paper{{background:#fff;border:3px solid #147a38;border-radius:28px;padding:24px;box-shadow:0 20px 60px rgba(20,122,56,.16);position:relative;overflow:hidden}}
+      .receipt-head{{display:flex;gap:14px;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #d7eadc;padding-bottom:16px}}
+      .receipt-brand{{display:flex;gap:14px;align-items:center}} .receipt-icon{{width:72px;height:72px;border-radius:22px;background:linear-gradient(135deg,#16a34a,#0b6b32);color:#fff;font-size:40px;display:flex;align-items:center;justify-content:center}}
+      .receipt-title{{font-size:40px;font-weight:950;color:#146c35;letter-spacing:-1px;line-height:1}} .receipt-sub{{font-size:20px;color:#215b35;font-weight:800;margin-top:6px}}
+      .receipt-meta{{text-align:right;color:#101828;line-height:1.8;font-size:15px}}
+      .receipt-status{{display:inline-flex;align-items:center;gap:8px;margin:18px 0 10px;padding:12px 18px;border-radius:14px;background:linear-gradient(135deg,#149447,#08722f);color:#fff;font-weight:900;font-size:18px}}
+      .receipt-section{{margin-top:16px;padding-top:10px;border-top:1px dashed #94bd9f}} .receipt-section h3{{margin:0 0 12px;color:#147a38;font-size:22px}}
+      .receipt-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}} .receipt-line{{font-size:17px;line-height:1.8}} .receipt-line b{{color:#101828}}
+      .amount-box{{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1.5px solid #86b592;border-radius:18px;overflow:hidden;background:#fbfffc}} .amount-left,.amount-right{{padding:18px}} .amount-left{{border-right:1px dashed #86b592}}
+      .amount-big{{font-size:36px;font-weight:950;color:#215b35}}
+      .sign-grid{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:14px}} .sign-box{{border:1.5px solid #9ec2a6;border-radius:18px;min-height:165px;padding:12px;text-align:center;background:#fff}}
+      .sign-label{{display:inline-block;margin-top:-28px;background:#10863d;color:white;padding:6px 18px;border-radius:10px;font-weight:900}} .receipt-sign-img{{max-width:100%;max-height:120px;object-fit:contain;margin-top:12px}}
+      .sign-name{{border-top:1px dashed #86b592;margin:12px 20px 0;padding-top:8px;color:#475467}}
+      .missing-evidence{{min-height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#667085;background:#f8fafc;border-radius:12px;margin-top:12px}}
+      .receipt-footer{{margin-top:18px;border-radius:18px;background:#f3f8f4;padding:14px;display:flex;justify-content:space-between;gap:16px;align-items:center;color:#215b35}}
+      .receipt-actions{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}} .receipt-action{{text-decoration:none;text-align:center;border-radius:18px;padding:16px 18px;font-size:18px;font-weight:950}} .receipt-action.ok{{background:#16a34a;color:white}} .receipt-action.bad{{background:#fee2e2;color:#dc2626}}
+      @media(max-width:720px){{.receipt-paper{{padding:16px;border-radius:22px}}.receipt-title{{font-size:32px}}.receipt-head,.receipt-grid,.amount-box,.sign-grid{{grid-template-columns:1fr;display:grid}}.receipt-meta{{text-align:left}}.amount-left{{border-right:0;border-bottom:1px dashed #86b592}}.receipt-actions{{grid-template-columns:1fr}}}}
+    </style>
+    <div class='receipt-wrap'>
+      <div class='receipt-paper'>
+        <div class='receipt-head'>
+          <div class='receipt-brand'><div class='receipt-icon'>฿</div><div><div class='receipt-title'>{title}</div><div class='receipt-sub'>กองทุนสำนักงานเขต</div></div></div>
+          <div class='receipt-meta'><b>เลขที่ใบเสร็จ:</b> {receipt_number(payment)}<br><b>วันที่ออกใบเสร็จ:</b> {date_txt}<br><b>เวลา:</b> {time_txt} น.</div>
+        </div>
+        <div class='receipt-status'>✅ {hero_status}</div>
+        <div class='receipt-section'><h3>👤 ข้อมูลผู้ชำระเงิน</h3><div class='receipt-grid'>
+          <div class='receipt-line'><b>ชื่อ-สกุล:</b> {member}<br><b>ประเภท:</b> {ptype}</div>
+          <div class='receipt-line'><b>เดือน:</b> {round_title}<br><b>สถานะ:</b> {html.escape(payment.status or '-')}</div>
+        </div></div>
+        <div class='receipt-section'><h3>💵 รายละเอียดการชำระเงิน</h3><div class='amount-box'>
+          <div class='amount-left'><div class='muted'>ยอดเงินที่ชำระ</div><div class='amount-big'>{amount_txt} <span style='font-size:20px'>บาท</span></div><div class='note'>(ตามยอดที่ระบบกำหนด)</div></div>
+          <div class='amount-right'><div class='receipt-line'>📅 <b>วันที่ชำระ:</b> {date_txt}<br>🕘 <b>เวลาที่ชำระ:</b> {time_txt} น.</div></div>
+        </div></div>
+        <div class='receipt-section'><h3>📝 หมายเหตุ</h3><div class='receipt-line'>{html.escape(payment.rejection_reason or '-')}</div></div>
+        <div class='receipt-section'><h3>🖼 {main_label}</h3><div class='sign-grid'>
+          <div class='sign-box'><span class='sign-label'>ผู้ชำระเงิน</span>{img_block}<div class='sign-name'>( {member} )<br>วันที่ {date_txt} เวลา {time_txt} น.</div></div>
+          <div class='sign-box'><span class='sign-label'>ผู้รับเงิน</span><div style='font-size:48px;margin:28px 0 8px'>👩🏻‍💼</div><div class='sign-name'>( {receiver} )<br>{'รออนุมัติ' if payment.status != 'paid' else 'อนุมัติแล้ว'}</div></div>
+        </div></div>
+        <div class='receipt-footer'><div>🛡️ ขอบคุณที่ร่วมเป็นส่วนหนึ่งในการสนับสนุนพวกเรา<br><b>FundBot System</b></div><div style='font-size:44px'>▦</div></div>
+        <div class='receipt-actions'>{approve_btn}{reject_btn}</div>
+      </div>
+    </div>
+    """
+
+
 def evidence_sig(payment_id: int) -> str:
     secret = settings.ADMIN_TOKEN or settings.LINE_CHANNEL_SECRET or "fundbot"
     return hmac.new(secret.encode("utf-8"), f"evidence:{payment_id}".encode("utf-8"), hashlib.sha256).hexdigest()
@@ -443,7 +548,7 @@ def notify_admin_pending_slip(db: Session, payment: Payment):
                 "spacing": "sm",
                 "contents": [
                     {"type": "button", "style": "primary", "color": "#16A34A", "action": {"type": "uri", "label": "✅ อนุมัติ", "uri": approve_url}},
-                    {"type": "button", "style": "secondary", "action": {"type": "uri", "label": "🖼 ดูสลิป/ลายเซ็น", "uri": evidence_url_for_admin}},
+                    {"type": "button", "style": "secondary", "action": {"type": "uri", "label": "🧾 ดูใบเสร็จ/หลักฐาน", "uri": evidence_url_for_admin}},
                     {"type": "button", "style": "link", "color": "#DC2626", "action": {"type": "uri", "label": "❌ ไม่ผ่าน", "uri": reject_url}},
                 ]
             }
@@ -1375,18 +1480,20 @@ def public_signed_evidence(payment_id: int, sig: str = "", db: Session = Depends
 
 
 
-@app.get("/line-admin/evidence/{payment_id}")
+@app.get("/line-admin/evidence/{payment_id}", response_class=HTMLResponse)
 def line_admin_evidence(payment_id: int, aid: int | None = None, exp: int | None = None, sig: str = "", db: Session = Depends(get_db)):
-    verify_line_admin_action(db, "evidence", payment_id, aid, exp, sig, roles=("owner", "approver", "viewer"))
+    admin_ctx = verify_line_admin_action(db, "evidence", payment_id, aid, exp, sig, roles=("owner", "approver", "viewer"))
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
-    path = evidence_file_path(p)
-    if not path or not path.exists() or not path.is_file():
-        raise HTTPException(404, detail="ไม่พบไฟล์หลักฐาน อาจเกิดจากการ redeploy/restart โดยยังไม่ได้ผูก Railway Volume")
-    suffix = path.suffix.lower()
-    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
-    return FileResponse(path, media_type=media_type, filename=path.name)
+    links = {}
+    admin = db.query(AdminUser).filter(AdminUser.id == int(aid or 0), AdminUser.active == True).first()
+    if admin and admin.role in ["owner", "approver"] and p.status != "paid":
+        links = {
+            "approve": line_admin_signed_url("approve", p.id, admin),
+            "reject": line_admin_signed_url("reject", p.id, admin),
+        }
+    return page("ใบเสร็จ/หลักฐาน", receipt_html(p, line_links=links))
 
 
 @app.get("/line-admin/approve/{payment_id}", response_class=HTMLResponse)
@@ -1454,18 +1561,13 @@ def line_admin_reject(payment_id: int, aid: int = Form(...), exp: int = Form(...
             push(target, [text(f"❌ ไม่ผ่าน: {p.member.name}\nเหตุผล: {reason.strip()}\nโดย: {admin_ctx['name']}")])
     return page("บันทึกแล้ว", f"<div class='card'><h2>❌ บันทึกว่าไม่ผ่านแล้ว</h2><p><b>{html.escape(p.member.name)}</b></p><p>เหตุผล: {html.escape(reason.strip())}</p><p class='note'>ปิดหน้านี้ได้เลย</p></div>")
 
-@app.get("/admin/evidence/{payment_id}")
+@app.get("/admin/evidence/{payment_id}", response_class=HTMLResponse)
 def admin_evidence(payment_id: int, request: Request, token: str = "", db: Session = Depends(get_db)):
     require_admin(request, db, token)
     p = db.query(Payment).filter(Payment.id == payment_id).first()
     if not p:
         raise HTTPException(404)
-    path = evidence_file_path(p)
-    if not path or not path.exists() or not path.is_file():
-        raise HTTPException(404, detail="ไม่พบไฟล์หลักฐาน อาจเกิดจากการ redeploy/restart โดยยังไม่ได้ผูก Railway Volume")
-    suffix = path.suffix.lower()
-    media_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
-    return FileResponse(path, media_type=media_type, filename=path.name)
+    return page("ใบเสร็จ/หลักฐาน", receipt_html(p))
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
